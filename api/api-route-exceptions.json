@@ -848,6 +848,13 @@
       "reason": "Migrating to analyst/v1.ListAgentSkills in commit 9 of #3207. Blocked on sebuf#150.",
       "owner": "@SebastienMelki",
       "removal_issue": "#3207"
+    },
+    {
+      "path": "api/ios-bundle.ts",
+      "category": "internal-helper",
+      "reason": "Single-request reference-data bundle for the WorldView iOS client \u2014 replaces eleven dead /api/v8/* routes plus /api/youtube/sources. Serves compile-time constants already exported from src/config and shared/, adapted to the client's decode shapes; no upstream fetch, no per-request work, strong ETag + 304. A proto service would add eleven message trees for tables that only ever change on deploy.",
+      "owner": "@selimata",
+      "removal_issue": null
     }
   ]
 }

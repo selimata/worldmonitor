@@ -53,17 +53,22 @@ function call(pathOrUrl: string, ua: string, headers: Record<string, string> = {
 }
 
 describe('middleware AI crawler variant stub', () => {
-  it('links every web-served variant dashboard', async () => {
+  // Upstream serves an AI-crawler HTML stub on each variant host's root. This
+  // fork has no web UI on any host — the API-only guard 404s `/` before the
+  // stub can run — so the contract worth pinning is that no crawler, on any
+  // host, gets a dashboard page out of this deployment.
+  it('serves no crawler dashboard stub on this API-only deployment', async () => {
     const res = call('https://tech.worldmonitor.app/', 'Mozilla/5.0 GPTBot/1.1');
     assert.ok(res instanceof Response);
-    assert.equal(res.status, 200);
+    assert.equal(res.status, 404);
 
-    const html = await res.text();
+    const body = await res.text();
+    assert.match(body, /API only/);
     for (const variant of WEB_DASHBOARD_VARIANTS) {
-      const { siteName: name, url: dashboardUrl } = VARIANT_META[variant];
+      const { url: dashboardUrl } = VARIANT_META[variant];
       assert.ok(
-        html.includes(`<li><a href="${dashboardUrl}">${name}</a></li>`),
-        `AI crawler stub must link the ${variant} dashboard`,
+        !body.includes(dashboardUrl),
+        `the API-only 404 must not advertise the ${variant} dashboard`,
       );
     }
   });

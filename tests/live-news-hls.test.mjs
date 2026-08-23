@@ -11,6 +11,10 @@ const readSrc = (relPath) => readFileSync(resolve(root, relPath), 'utf-8');
 
 const liveNewsSrc = readSrc('src/components/LiveNewsPanel.ts');
 const liveWebcamsSrc = readSrc('src/components/LiveWebcamsPanel.ts');
+// The channel/webcam tables moved to shared/ so the iOS bundle endpoint can
+// serve them (server/ cannot import src/components/). Behaviour assertions
+// below still read the panels; table assertions read the registry.
+const liveChannelsSrc = readSrc('shared/live-channels-data.ts');
 const liveNewsSvc = readSrc('src/services/live-news.ts');
 const youtubeApi = readSrc('api/youtube/live.js');
 const sidecarSrc = readSrc('src-tauri/sidecar/local-api-server.mjs');
@@ -30,7 +34,7 @@ const getCspDirective = (csp, directive) =>
 
 const extractArrayIds = (arrayName) => {
   const pattern = new RegExp(`const ${arrayName}[^=]*=[^\\[]*\\[([\\s\\S]*?)\\];`);
-  const match = liveNewsSrc.match(pattern);
+  const match = liveChannelsSrc.match(pattern);
   if (!match) return [];
   return [...match[1].matchAll(/id:\s*'([^']+)'/g)].map(m => m[1]);
 };
@@ -40,7 +44,7 @@ const techIds = extractArrayIds('TECH_LIVE_CHANNELS');
 const optionalIds = extractArrayIds('OPTIONAL_LIVE_CHANNELS');
 const allChannelIds = new Set([...fullIds, ...techIds, ...optionalIds]);
 
-const hlsMapMatch = liveNewsSrc.match(/const DIRECT_HLS_MAP[^{]*\{([\s\S]*?)\};/);
+const hlsMapMatch = liveChannelsSrc.match(/const DIRECT_HLS_MAP[^{]*\{([\s\S]*?)\};/);
 const hlsMapEntries = hlsMapMatch
   ? [...hlsMapMatch[1].matchAll(/'([^']+)':\s*'([^']+)'/g)].map(m => ({ id: m[1], url: m[2] }))
   : [];
@@ -62,7 +66,7 @@ describe('DIRECT_HLS_MAP integrity', () => {
 
   it('every mapped channel has a fallbackVideoId or hlsUrl', () => {
     for (const { id } of hlsMapEntries) {
-      const channelDef = liveNewsSrc.match(new RegExp(`id:\\s*'${id}'[^}]*}`));
+      const channelDef = liveChannelsSrc.match(new RegExp(`id:\\s*'${id}'[^}]*}`));
       assert.ok(channelDef, `Channel '${id}' definition not found`);
       const hasFallback = /fallbackVideoId:\s*'[^']+'/.test(channelDef[0]);
       const hasHlsUrl = /hlsUrl:\s*'[^']+'/.test(channelDef[0]);
@@ -95,7 +99,7 @@ describe('DIRECT_HLS_MAP integrity', () => {
 describe('channel data integrity', () => {
   it('all FULL_LIVE_CHANNELS have fallbackVideoId', () => {
     for (const id of fullIds) {
-      const match = liveNewsSrc.match(new RegExp(`id:\\s*'${id}'[^}]*}`, 's'));
+      const match = liveChannelsSrc.match(new RegExp(`id:\\s*'${id}'[^}]*}`, 's'));
       assert.ok(match, `Channel '${id}' not found`);
       assert.match(match[0], /fallbackVideoId:\s*'[^']+'/,
         `FULL channel '${id}' missing fallbackVideoId`);
@@ -108,7 +112,7 @@ describe('channel data integrity', () => {
     for (const id of allIds) counts[id] = (counts[id] || 0) + 1;
     for (const [id, count] of Object.entries(counts)) {
       if (count > 1) {
-        const defs = [...liveNewsSrc.matchAll(new RegExp(`id:\\s*'${id}'[^}]*}`, 'g'))].map(m => m[0]);
+        const defs = [...liveChannelsSrc.matchAll(new RegExp(`id:\\s*'${id}'[^}]*}`, 'g'))].map(m => m[0]);
         const handles = defs.map(d => d.match(/handle:\s*'([^']+)'/)?.[1]);
         const uniqueHandles = new Set(handles);
         assert.equal(uniqueHandles.size, 1,
@@ -118,14 +122,14 @@ describe('channel data integrity', () => {
   });
 
   it('TRT World handle is @TRTWorld (not @taborrtworld)', () => {
-    const trt = liveNewsSrc.match(/id:\s*'trt-world'[^}]*}/);
+    const trt = liveChannelsSrc.match(/id:\s*'trt-world'[^}]*}/);
     assert.ok(trt, 'trt-world channel not found');
     assert.match(trt[0], /handle:\s*'@TRTWorld'/,
       'TRT World handle should be @TRTWorld');
   });
 
   it('euronews handle is @euronews (not typo)', () => {
-    const match = liveNewsSrc.match(/id:\s*'euronews'[^}]*}/);
+    const match = liveChannelsSrc.match(/id:\s*'euronews'[^}]*}/);
     assert.ok(match, 'euronews channel not found');
     assert.match(match[0], /handle:\s*'@euronews'/,
       'euronews handle should be @euronews');
@@ -430,7 +434,7 @@ describe('optional channels fallback coverage', () => {
 
   for (const id of highPriorityOptional) {
     it(`${id} has a fallback path`, () => {
-      const match = liveNewsSrc.match(new RegExp(`id:\\s*'${id}'[^}]*}`));
+      const match = liveChannelsSrc.match(new RegExp(`id:\\s*'${id}'[^}]*}`));
       assert.ok(match, `Channel '${id}' not found in OPTIONAL_LIVE_CHANNELS`);
       const hasFallback = /fallbackVideoId:\s*'[A-Za-z0-9_-]{11}'/.test(match[0]);
       const hasHlsUrl = /hlsUrl:\s*'[^']+'/.test(match[0]);
@@ -441,7 +445,7 @@ describe('optional channels fallback coverage', () => {
   }
 
   it('channels with useFallbackOnly also have fallbackVideoId or hlsUrl', () => {
-    const useFallbackMatches = [...liveNewsSrc.matchAll(/id:\s*'([^']+)'[^}]*useFallbackOnly:\s*true[^}]*}/g)];
+    const useFallbackMatches = [...liveChannelsSrc.matchAll(/id:\s*'([^']+)'[^}]*useFallbackOnly:\s*true[^}]*}/g)];
     for (const m of useFallbackMatches) {
       const channelId = m[1];
       const hasFallback = /fallbackVideoId:\s*'[^']+'/.test(m[0]);

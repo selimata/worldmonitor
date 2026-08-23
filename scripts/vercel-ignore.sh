@@ -12,7 +12,7 @@ if [ "$VERCEL_GIT_COMMIT_REF" = "main" ] && [ -n "$VERCEL_GIT_PREVIOUS_SHA" ]; t
       'scripts/build-sitemap.mjs' 'scripts/discover-content-corpus-pages.mjs' \
       'scripts/crawlable-live-tools.mjs' 'scripts/crawlable-sources-page.mjs' \
       'scripts/source-origin.mjs' 'scripts/source-origin.d.mts' \
-      'scripts/generate-inventory-facts.mjs' \
+      'scripts/generate-inventory-facts.mjs' 'scripts/build-api-only-output.mjs' \
       'scripts/docs-stats.mjs' 'scripts/source-attribution.mjs' 'scripts/vercel-ignore.sh' \
       'package.json' 'package-lock.json' 'vite.config.ts' 'tsconfig.json' \
       'tsconfig.api.json' 'vercel.json' 'middleware.ts' 'index.html' | head -1)

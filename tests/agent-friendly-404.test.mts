@@ -132,10 +132,22 @@ describe('agent-friendly 404s (orank agent-friendly-404)', () => {
   });
 
   it('does not intercept known product routes or mutating methods', () => {
-    for (const path of ['/', '/dashboard', '/stocks/AAPL', '/story', '/pro', '/docs/mcp', '/countries/united-states']) {
+    // `/` is deliberately absent: this fork serves the iOS app's API and has no
+    // home page, so middleware 404s the root before any vercel.json route runs.
+    for (const path of ['/dashboard', '/stocks/AAPL', '/story', '/pro', '/docs/mcp', '/countries/united-states']) {
       assert.equal(call(path, { accept: '*/*' }), undefined, `${path} must keep its vercel.json route`);
     }
     assert.equal(call('/some-path-that-does-not-exist', { method: 'POST', accept: '*/*' }), undefined);
+  });
+
+  it('serves no home page on this API-only deployment', async () => {
+    for (const path of ['/', '/index.html']) {
+      const res = call(path, { accept: '*/*' });
+      assert.ok(res instanceof Response, `${path} must be answered by middleware, not routed`);
+      assert.equal(res.status, 404);
+      assert.equal(res.headers.get('content-type'), 'application/json');
+      assert.match(await res.text(), /API only/);
+    }
   });
 
   it('404s leaked SPA guesses that used to soft-404 the dashboard (#6575, #6836)', async () => {

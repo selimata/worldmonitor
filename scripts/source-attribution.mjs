@@ -49,15 +49,25 @@ const MANIFEST_KIND_RE = /^(?:structured|feed|operational-status)(?:\+(?:structu
 const LOGICAL_KIND_RE = /^(?:candidate|structured|feed|operational-status)(?:\+(?:structured|feed|operational-status))*$/;
 
 const SOURCE_ROOTS = ['scripts', 'server', 'api', 'src'];
+// `shared/` is not a scan root — it is mostly pure data tables with no upstream
+// hosts — but the live-channel registry moved there so the iOS bundle endpoint
+// could read it, and it still declares HLS hosts. Listing the one file keeps
+// those hosts attributable without walking the whole directory.
+const EXTRA_SOURCE_FILES = ['shared/live-channels-data.ts'];
 const SOURCE_EXTENSIONS = new Set(['.cjs', '.js', '.mjs', '.ts', '.tsx']);
-const FEED_FILES = new Set([
-  ...FEED_DECLARATION_FILES,
-  // LiveNewsPanel owns optional native-video HLS feeds. They are observed for
-  // completeness, but their playback transport is excluded from the data
+const LIVE_CHANNEL_HLS_FILES = [
+  // LiveNewsPanel owns optional native-video HLS feeds (its proxied map still
+  // does; the direct map now lives in the shared registry). They are observed
+  // for completeness, but their playback transport is excluded from the data
   // provider count below.
   'src/components/LiveNewsPanel.ts',
+  'shared/live-channels-data.ts',
+];
+const FEED_FILES = new Set([
+  ...FEED_DECLARATION_FILES,
+  ...LIVE_CHANNEL_HLS_FILES,
 ]);
-const PRESENTATION_ONLY_FILES = new Set(['src/components/LiveNewsPanel.ts']);
+const PRESENTATION_ONLY_FILES = new Set(LIVE_CHANNEL_HLS_FILES);
 const STATUS_FILE = 'server/worldmonitor/infrastructure/v1/list-service-statuses.ts';
 
 // URL literals are intentionally parsed before classification.  This catches
@@ -946,6 +956,9 @@ function walkSourceFiles(rootDir) {
     }
   };
   for (const root of SOURCE_ROOTS) visit(root);
+  for (const extra of EXTRA_SOURCE_FILES) {
+    if (existsSync(join(rootDir, extra))) files.push(extra);
+  }
   return files.sort();
 }
 

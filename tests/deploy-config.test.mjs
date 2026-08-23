@@ -358,19 +358,19 @@ describe('crawlable content corpus deployment contracts', () => {
     writeFileSync(target, '<!doctype html><html><head>' + head + '</head><body>fixture</body></html>');
   };
 
-  it('pins the deploy build command in vercel.json to a script that builds /pro', () => {
+  it('pins an API-only deploy build command in vercel.json', () => {
     // vercel.json overrides the dashboard's Build Command, which is where this
-    // used to live -- invisible to the repo and changeable without a diff. Since
-    // #6898 stopped committing public/pro/, a dashboard edit away from a
-    // build:pro-chaining script no longer ships a STALE /pro, it ships no /pro:
-    // a 404 on www, and the dashboard SPA shell at 200 in the root Docker image.
+    // used to live -- invisible to the repo and changeable without a diff.
+    //
+    // This fork serves the WorldView iOS app's API; the dashboard SPA, /pro and
+    // the marketing site ship from a separate project (see the fork guard in
+    // middleware.ts). So the contract inverted: the deploy must NOT run Vite,
+    // because a dist/index.html would put the dashboard shell back at 200 on a
+    // deployment whose whole point is that it has no web UI.
     //
     // Deliberately resolved through package.json rather than string-matched
-    // against 'npm run build:full'. The property that matters is "the deploy
-    // builds /pro before Vite copies public/ into dist/", so pointing
-    // buildCommand at any other script (build:tech, a bare `vite build`) has to
-    // fail here -- a literal comparison would pass anything spelled right and
-    // prove nothing about what that script does.
+    // against 'npm run build:api': the property that matters is what the script
+    // does, and a literal comparison would pass anything spelled right.
     const buildCommand = vercelConfig.buildCommand;
     assert.equal(
       typeof buildCommand,
@@ -387,13 +387,31 @@ describe('crawlable content corpus deployment contracts', () => {
     const script = packageJson.scripts[scriptName];
     assert.ok(script, `vercel.json buildCommand names scripts["${scriptName}"], which does not exist`);
     assert.ok(
-      script.includes('npm run build:pro'),
-      `the deploy build command (${buildCommand}) must chain build:pro — public/pro/ is gitignored, so nothing else produces /pro`,
+      !script.includes('vite build'),
+      `the deploy build command (${buildCommand}) must not run Vite — this deployment serves API only`,
     );
     assert.ok(
-      script.indexOf('npm run build:pro') < script.indexOf('vite build'),
-      `the deploy build command (${buildCommand}) must build /pro before Vite copies public/ into dist/`,
+      !script.includes('npm run build:blog') && !script.includes('npm run build:pro'),
+      `the deploy build command (${buildCommand}) must not build the blog or /pro on the API-only deployment`,
     );
+    assert.ok(
+      script.includes('scripts/build-api-only-output.mjs'),
+      `the deploy build command (${buildCommand}) must assemble dist/ from public/ via build-api-only-output.mjs`,
+    );
+    assert.equal(
+      vercelConfig.outputDirectory,
+      'dist',
+      'vercel.json must pin outputDirectory — without Vite there is no framework preset to infer it from',
+    );
+
+    // The generated inputs the Edge functions bundle against are produced by
+    // the prebuild generators, not by Vite, so they must still run.
+    for (const required of ['npm run product:facts', 'npm run build:openapi', 'npm run build:agent-skills']) {
+      assert.ok(
+        script.includes(required),
+        `the deploy build command (${buildCommand}) must still run "${required}" — Edge routes import its generated output`,
+      );
+    }
   });
 
   it('runs content corpus sitemap integration after generated blog pages but before Vite builds', () => {

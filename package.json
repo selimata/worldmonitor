@@ -18,6 +18,7 @@
   },
   "type": "module",
   "scripts": {
+    "build:api": "npm run product:facts && npm run build:openapi && npm run build:agent-skills && node scripts/build-api-only-output.mjs",
     "lint": "biome lint ./src ./server ./api ./tests ./e2e ./scripts ./middleware.ts && npm run lint:safe-html",
     "lint:fix": "biome check ./src ./server ./api ./tests ./e2e ./scripts ./middleware.ts --fix",
     "lint:boundaries": "node scripts/lint-boundaries.mjs",
