@@ -412,6 +412,13 @@ const LLM_PROVIDERS = [
     apiUrl: 'https://api.groq.com/openai/v1/chat/completions',
     model: GROQ_DEFAULT_MODEL,
     headers: (key) => ({ 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json', 'User-Agent': CHROME_UA }),
+    // GROQ_DEFAULT_MODEL (openai/gpt-oss-*) is a reasoning model: without this
+    // it spends the whole max_tokens budget on reasoning tokens and returns
+    // finish_reason: "length" with an EMPTY message.content, which this file
+    // logs as "groq: empty response" and treats as a provider failure. Groq has
+    // no equivalent of OpenRouter's reasoning.enabled:false — the only lever is
+    // reasoning_effort, and the API rejects "none" (low|medium|high only).
+    extraBody: { reasoning_effort: 'low' },
     timeout: 15_000,
   },
 ];

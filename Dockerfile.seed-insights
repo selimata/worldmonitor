@@ -1,0 +1,68 @@
+# =============================================================================
+# news:insights seed cron
+# =============================================================================
+# Runs scripts/seed-insights.mjs as a Railway cron. Produces `news:insights:v1`
+# (the AI World Brief snapshot) which /api/bootstrap?keys=insights serves and
+# the iOS client reads.
+#
+# Cadence matters: shared/insights-snapshot.js caps a snapshot's usable age at
+# 60 minutes and the iOS client repeats that gate (WorldBrief.swift
+# `InsightsSnapshot.maxAge`). A schedule slower than hourly publishes snapshots
+# that are already refused on arrival. */30 leaves one whole retry window.
+#
+# Unlike the other seed crons this image installs NOTHING: the whole
+# seed-insights import graph is Node builtins plus the files COPY'd below
+# (verified by resolving the graph, including the createRequire hop in
+# _seed-utils.mjs). No `npm ci`, no scripts/package.json — which also keeps
+# scripts/shared/package.json ("type":"module") as the nearest pjson for the
+# .js files under scripts/shared/. Ship that directory whole or those files
+# parse as CommonJS and die on their first `export`.
+#
+# Required env (Railway service vars):
+#   UPSTASH_REDIS_REST_URL
+#   UPSTASH_REDIS_REST_TOKEN
+#   OPENROUTER_API_KEY            (primary brief synthesizer)
+#   GROQ_API_KEY                  (last-resort fallback in the provider chain)
+#   API_BASE_URL                  (host whose list-feed-digest warms the digest
+#                                  into the SAME Redis this cron writes)
+#   WORLDMONITOR_RELAY_KEY        (must match a value in that host's
+#                                  WORLDMONITOR_VALID_KEYS)
+# Optional:
+#   BRIEF_VALIDATOR_MODE=shadow   (revert hallucination enforcement in an
+#                                  incident; default is enforce)
+# =============================================================================
+
+FROM node:24-alpine@sha256:d32cdf619f63fe0471182d08996dd516c6275bb5fd31ae06e55a570bd9e1ad43
+
+WORKDIR /app
+
+# scripts/*.mjs are ESM by extension, but keep the root declaration so any
+# future .js added to scripts/ resolves the same way it does in the repo.
+RUN printf '{"type":"module","private":true}\n' > /app/package.json
+
+# Entry point + the modules it imports statically.
+COPY scripts/seed-insights.mjs ./scripts/
+COPY scripts/_china-news-coverage.mjs ./scripts/
+COPY scripts/_clustering.mjs ./scripts/
+COPY scripts/_insights-brief.mjs ./scripts/
+COPY scripts/_insights-synthesis-diagnostics.mjs ./scripts/
+COPY scripts/_llm-model-timeouts.mjs ./scripts/
+COPY scripts/_seed-contract.mjs ./scripts/
+COPY scripts/_seed-envelope-source.mjs ./scripts/
+COPY scripts/_seed-utils.mjs ./scripts/
+
+# _seed-utils.mjs reaches this through createRequire(import.meta.url), so no
+# static-import scan finds it. Omitting it fails at MODULE_NOT_FOUND on the
+# first import of _seed-utils.mjs — i.e. immediately, on every run.
+COPY scripts/_proxy-utils.cjs ./scripts/
+
+# llm-model-policy.cjs (GROQ_DEFAULT_MODEL, OpenRouter model ids) and
+# llm-telemetry.cjs. Small; shipped whole rather than cherry-picked.
+COPY scripts/lib/ ./scripts/lib/
+
+# brief-llm-core, story-identity, publisher-families, geo-extract and the
+# source-tiers.json / diplomacy-keywords.json data files _clustering.mjs
+# require()s at load. Includes the package.json noted above — keep it.
+COPY scripts/shared/ ./scripts/shared/
+
+CMD ["node", "scripts/seed-insights.mjs"]
