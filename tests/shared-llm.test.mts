@@ -437,7 +437,7 @@ describe('callLlm', () => {
       }
       const body = JSON.parse(String(init?.body || '{}')) as Record<string, unknown>;
       bodies.push(body);
-      const content = body.model === 'openai/gpt-oss-20b:free' ? 'backup answer' : '';
+      const content = body.model === 'google/gemma-4-31b-it:free' ? 'backup answer' : '';
       return new Response(JSON.stringify({
         choices: [{ message: { content } }],
         usage: { total_tokens: 5 },
@@ -447,11 +447,11 @@ describe('callLlm', () => {
     const result = await callLlm({ messages: [{ role: 'user', content: 'Answer briefly.' }] });
 
     assert.equal(result?.provider, 'openrouter-free-backup');
-    assert.equal(result?.model, 'openai/gpt-oss-20b:free');
+    assert.equal(result?.model, 'google/gemma-4-31b-it:free');
     assert.deepEqual(bodies.map(body => body.model), [
       'deepseek/deepseek-v4-flash',
       'google/gemma-4-26b-a4b-it:free',
-      'openai/gpt-oss-20b:free',
+      'google/gemma-4-31b-it:free',
     ]);
     for (const body of bodies) {
       assert.deepEqual(body.reasoning, { enabled: false });

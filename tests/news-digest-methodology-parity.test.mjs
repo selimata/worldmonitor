@@ -528,7 +528,8 @@ describe('news digest methodology parity', () => {
   it('documents news digest cache TTLs from the implementation', () => {
     const healthyTtl = extractNumericConst(digestSrc, 'CACHE_TTL_HEALTHY_S');
     const emptyTtl = extractNumericConst(digestSrc, 'CACHE_TTL_EMPTY_S');
-    const digestTtl = digestSrc.match(/cachedFetchJson<ListFeedDigestResponse>\(\s*digestCacheKey,\s*([0-9_]+)/s);
+    const digestTtl = digestSrc.match(/cachedFetchJson(?:WithMeta)?<ListFeedDigestResponse>\(\s*digestCacheKey,\s*([0-9_]+)/s);
+    const truncatedTtl = extractNumericConst(digestSrc, 'TRUNCATED_BUILD_TTL_S');
 
     assert.equal(
       healthyTtl,
@@ -551,6 +552,15 @@ describe('news digest methodology parity', () => {
       assert.ok(text.includes(`${emptyTtl} seconds`), 'docs must mention empty or failed feed TTL');
     }
     assert.ok(dataSourcesText.includes('900-second TTL'), 'data sources page must mention digest TTL');
+    assert.equal(
+      truncatedTtl,
+      120,
+      'truncated-build TTL changed; update docs/data-sources.mdx and this disclosure guard together',
+    );
+    assert.ok(
+      dataSourcesText.includes(`${truncatedTtl}-second TTL`),
+      'data sources page must disclose that a deadline-truncated digest retires early',
+    );
     assert.doesNotMatch(
       dataSourcesText,
       /cached\s+600s\s+per URL|per URL for 600 seconds/i,
@@ -872,13 +882,13 @@ describe('news digest methodology parity', () => {
     assert.deepEqual(providerModels, [
       'deepseek/deepseek-v4-flash',
       'google/gemma-4-26b-a4b-it:free',
-      'openai/gpt-oss-20b:free',
+      'google/gemma-4-31b-it:free',
       'openai/gpt-oss-20b',
     ]);
     assert.equal(weeklyTemperature, 0.3);
 
     assertDocMatches(
-      /Regional weekly briefs[\s\S]*tr(?:y|ies) OpenRouter first[\s\S]*`deepseek\/deepseek-v4-flash`[\s\S]*`google\/gemma-4-26b-a4b-it:free`[\s\S]*`openai\/gpt-oss-20b:free`[\s\S]*Groq `openai\/gpt-oss-20b`[\s\S]*temperature\s+`0\.3`/,
+      /Regional weekly briefs[\s\S]*tr(?:y|ies) OpenRouter first[\s\S]*`deepseek\/deepseek-v4-flash`[\s\S]*`google\/gemma-4-26b-a4b-it:free`[\s\S]*`google\/gemma-4-31b-it:free`[\s\S]*Groq `openai\/gpt-oss-20b`[\s\S]*temperature\s+`0\.3`/,
       'regional weekly brief provider order, models, and temperature',
     );
     assertDocMatches(

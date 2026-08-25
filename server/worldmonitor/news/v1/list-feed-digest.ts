@@ -8,7 +8,7 @@ import type {
   StoryMeta as ProtoStoryMeta,
   StoryPhase as ProtoStoryPhase,
 } from '../../../../src/generated/server/worldmonitor/news/v1/service_server';
-import { cachedFetchJson, getCachedJson, setCachedJson, getCachedJsonBatch, runRedisPipeline } from '../../../_shared/redis';
+import { cachedFetchJson, cachedFetchJsonWithMeta, getCachedJson, setCachedJson, getCachedJsonBatch, runRedisPipeline } from '../../../_shared/redis';
 import { markNoCacheResponse } from '../../../_shared/response-headers';
 import { sha256Hex } from '../../../_shared/hash';
 import { CHROME_UA } from '../../../_shared/constants';
@@ -1219,6 +1219,36 @@ function toProtoItem(item: ParsedItem, storyMeta?: ProtoStoryMeta): ProtoNewsIte
   };
 }
 
+// A build that ran out of DIGEST_RESPONSE_TIMEOUT_MS is still served — a thin
+// digest beats none — but it must not OWN the cache key for the full 900s.
+// Seen in production 2026-08-25: two of seven seed-insights runs read a cached
+// truncated build (230 items / 53 distinct sources vs 290 / 105 on a complete
+// one). A digest that thin carries no story that two outlets both filed, so the
+// brief's corroborated-cluster requirement found nothing and the run failed
+// INSIGHTS_SYNTHESIS_MISSING_CLUSTER with eligible=0 — the LKG froze and the
+// card fell back to its citation-less summary.
+//
+// 'timeout' is the right signal and 'empty' is not: per #7083 'timeout' marks a
+// feed whose batch NEVER RAN (deadline starvation), while 'empty' marks one
+// that completed and had nothing. With 282 feeds in the full variant, most
+// carrying no fresh item is ordinary — a quarter never being reached is not.
+const TRUNCATED_BUILD_TTL_S = 120;
+const TRUNCATED_BUILD_STARVED_RATIO = 0.25;
+
+export function wasDigestBuildTruncated(
+  variant: string,
+  feedStatuses: Record<string, string> | undefined,
+): boolean {
+  const inventory = Object.values(VARIANT_FEEDS[variant] ?? {})
+    .reduce((total, feeds) => total + feeds.length, 0);
+  if (inventory === 0) return false;
+  let starved = 0;
+  for (const status of Object.values(feedStatuses ?? {})) {
+    if (status === 'timeout') starved += 1;
+  }
+  return starved / inventory >= TRUNCATED_BUILD_STARVED_RATIO;
+}
+
 export async function listFeedDigest(
   ctx: ServerContext,
   req: ListFeedDigestRequest,
@@ -1236,7 +1266,7 @@ export async function listFeedDigest(
     // for the same key share a single buildDigest() run instead of fanning out
     // across all RSS feeds. Returning null skips the Redis write and caches a
     // neg-sentinel (120s) to absorb the request storm during degraded periods.
-    const fresh = await cachedFetchJson<ListFeedDigestResponse>(
+    const { data: fresh, source } = await cachedFetchJsonWithMeta<ListFeedDigestResponse>(
       digestCacheKey,
       900,
       async () => {
@@ -1247,6 +1277,13 @@ export async function listFeedDigest(
       120,
       { timeoutMs: DIGEST_RESPONSE_TIMEOUT_MS },
     );
+
+    // Only a build THIS call produced can be judged: on a cache hit the
+    // shortened TTL is already ticking, and rewriting it on every reader would
+    // keep resetting the very expiry that is supposed to retire it.
+    if (fresh !== null && source === 'fresh' && wasDigestBuildTruncated(variant, fresh.feedStatuses)) {
+      await setCachedJson(digestCacheKey, fresh, TRUNCATED_BUILD_TTL_S).catch(() => {});
+    }
 
     if (fresh === null) {
       markNoCacheResponse(ctx.request);

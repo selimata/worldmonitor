@@ -11,6 +11,16 @@
 Use `google/gemma-4-26b-a4b-it:free` as the default zero-price fallback.
 Use `openai/gpt-oss-20b:free` as the backup.
 
+> **Superseded 2026-08-25 (backup slot only).** OpenRouter retired the free tier
+> of `openai/gpt-oss-20b:free`; the endpoint now answers `404 "This model is
+> unavailable for free. The paid version is available now"`, so the backup slot
+> could never succeed. It is now `google/gemma-4-31b-it:free` — the larger
+> sibling of the primary, chosen because it inherits the same vendor terms this
+> document already cleared for production. The NVIDIA finding below still
+> stands: `nvidia/nemotron-3-super-120b-a12b:free` answers 200 and follows the
+> brief format correctly, but its NVIDIA API Trial Terms still bar production
+> use, so it remains rejected on licensing rather than capability.
+
 Do not use `nvidia/nemotron-3-super-120b-a12b:free` in production, despite its
 stronger technical profile. OpenRouter's endpoint notice says NVIDIA logs free
 endpoint use for security and product improvement and tells users not to submit
