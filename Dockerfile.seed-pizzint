@@ -1,0 +1,48 @@
+# =============================================================================
+# intelligence:pizzint seed cron
+# =============================================================================
+# Runs scripts/seed-pizzint.mjs as a Railway cron. Publishes
+# `intelligence:pizzint:seed:v1`, which
+# server/worldmonitor/intelligence/v1/get-pizzint-status.ts is the only reader
+# of — when that key is absent the handler drops the whole `pizzint` field and
+# answers `{"tensionPairs":[]}`, which looks like a healthy empty result rather
+# than missing data.
+#
+# Cadence: run on `*/10 * * * *`. api/health.js pins pizzint at maxStaleMin 30
+# (3x the relay's 10-min loop) and the payload TTL is 30 min, so a slower
+# schedule lets the key expire between runs.
+#
+# Upstream (pizzint.watch) blocks datacenter ranges from Vercel Edge — that is
+# the reason this fetch lives in a container at all instead of in the handler.
+#
+# Installs nothing: the import graph is Node builtins plus the files COPY'd
+# below. Verified by running the same file set in an empty directory with no
+# node_modules present.
+#
+# Required env (Railway service vars):
+#   UPSTASH_REDIS_REST_URL
+#   UPSTASH_REDIS_REST_TOKEN
+# =============================================================================
+
+FROM node:24-alpine@sha256:d32cdf619f63fe0471182d08996dd516c6275bb5fd31ae06e55a570bd9e1ad43
+
+WORKDIR /app
+
+RUN printf '{"type":"module","private":true}\n' > /app/package.json
+
+COPY scripts/seed-pizzint.mjs ./scripts/
+COPY scripts/_seed-utils.mjs ./scripts/
+COPY scripts/_seed-contract.mjs ./scripts/
+COPY scripts/_seed-envelope-source.mjs ./scripts/
+
+# Reached through createRequire(import.meta.url) in _seed-utils.mjs, so no
+# static-import scan lists it. Omitting it fails at MODULE_NOT_FOUND on the
+# first import — immediately, on every run.
+COPY scripts/_proxy-utils.cjs ./scripts/
+
+# _seed-utils.mjs imports this for its run telemetry. Copied as a single file
+# rather than the whole lib/ directory: nothing else under lib/ is reachable
+# from this entry point.
+COPY scripts/lib/llm-telemetry.cjs ./scripts/lib/
+
+CMD ["node", "scripts/seed-pizzint.mjs"]

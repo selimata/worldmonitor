@@ -15,8 +15,11 @@
 # (verified by resolving the graph, including the createRequire hop in
 # _seed-utils.mjs). No `npm ci`, no scripts/package.json — which also keeps
 # scripts/shared/package.json ("type":"module") as the nearest pjson for the
-# .js files under scripts/shared/. Ship that directory whole or those files
-# parse as CommonJS and die on their first `export`.
+# .js files under scripts/shared/, so COPY that directory whole rather than
+# cherry-picking files out of it. Dropping its package.json is not fatal here
+# (the /app/package.json written above is also "type":"module"), but under a
+# typeless parent Node only reaches ESM by reparsing after a
+# MODULE_TYPELESS_PACKAGE_JSON warning, at a documented performance cost.
 #
 # Required env (Railway service vars):
 #   UPSTASH_REDIS_REST_URL
