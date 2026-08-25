@@ -1033,7 +1033,19 @@ export function createDomainGateway(
           emitRequest(403, 'auth_401', null);
           return new Response(
             JSON.stringify({ error: 'Forbidden', detail: `client attestation ${attested.reason}` }),
-            { status: 403, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
+            {
+              status: 403,
+              headers: {
+                'Content-Type': 'application/json',
+                // This early return skips the per-route cache tier, so without
+                // an explicit directive the rejection inherits whatever the
+                // edge decides. Several RPCs here are public and CDN-cached
+                // with `vary: Origin` — one cached 403 would answer every
+                // caller sharing that entry until it aged out.
+                'Cache-Control': 'no-store',
+                ...corsHeaders,
+              },
+            },
           );
         }
       }
