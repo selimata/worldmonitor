@@ -4042,19 +4042,36 @@ async function classifyFetchLlm(titles) {
 
 let classifyInFlight = false;
 
+// The digest this loop classifies must come from the deployment the relay
+// actually feeds, not from the upstream product's host. A fork pointing here
+// asks a host it does not own, gets 401 ("API key required" — list-feed-digest
+// is not in PUBLIC_NO_AUTH_RPC_PATHS), and silently classifies nothing: the
+// cache stays empty, list-feed-digest falls back to classifyByKeyword, and the
+// world brief ranks on keyword categories (llmDrivenRanked=0).
+const WM_API_BASE_URL = (process.env.WM_API_BASE_URL || 'https://api.worldmonitor.app').replace(/\/+$/, '');
+const WM_API_KEY = process.env.WORLDMONITOR_API_KEY || process.env.WM_API_KEY || '';
+
 async function seedClassifyForVariant(variant, seenTitles) {
-  const digestUrl = `https://api.worldmonitor.app/api/news/v1/list-feed-digest?variant=${variant}&lang=en`;
+  const digestUrl = `${WM_API_BASE_URL}/api/news/v1/list-feed-digest?variant=${variant}&lang=en`;
   let digest;
   try {
+    const headers = { Accept: 'application/json', 'User-Agent': CHROME_UA };
+    if (WM_API_KEY) headers['X-WorldMonitor-Key'] = WM_API_KEY;
     const resp = await new Promise((resolve, reject) => {
-      const req = https.get(digestUrl, {
-        headers: { Accept: 'application/json', 'User-Agent': CHROME_UA },
-        timeout: 15000,
-      }, resolve);
+      const req = https.get(digestUrl, { headers, timeout: 15000 }, resolve);
       req.on('error', reject);
       req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
     });
-    if (resp.statusCode !== 200) { resp.resume(); return { total: 0, classified: 0, skipped: 0 }; }
+    if (resp.statusCode !== 200) {
+      resp.resume();
+      // Was a bare `return` — a 401 and a genuinely empty news cycle both
+      // surfaced as "0 titles, 0 classified", which is how this went unnoticed.
+      console.warn(
+        `[Classify] ${variant}: digest fetch HTTP ${resp.statusCode} from ${WM_API_BASE_URL}` +
+        (WM_API_KEY ? '' : ' (no WORLDMONITOR_API_KEY set)'),
+      );
+      return { total: 0, classified: 0, skipped: 0 };
+    }
     const body = await new Promise((resolve) => {
       let d = '';
       resp.on('data', (c) => { d += c; });
