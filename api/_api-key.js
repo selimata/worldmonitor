@@ -20,7 +20,15 @@ export function getHeaderApiKey(req) {
 
 async function isValidEnterpriseKey(key) {
   if (!key) return false;
-  const validKeys = (process.env.WORLDMONITOR_VALID_KEYS || '').split(',').filter(Boolean);
+  // Trim each entry. api/wm-session.js parses the SAME variable through
+  // envList(), which trims — so a key added as `old, new` was accepted there
+  // and rejected here, and the operator sees "Invalid API key" on a key they
+  // just installed. Splitting the list two ways was the bug; a space after a
+  // comma is not an operator error worth an outage.
+  const validKeys = (process.env.WORLDMONITOR_VALID_KEYS || '')
+    .split(',')
+    .map((value) => value.trim())
+    .filter(Boolean);
   return timingSafeIncludes(key, validKeys);
 }
 
