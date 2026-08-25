@@ -569,6 +569,83 @@ test('classifyKey: an old single insights synthesis failure warns by age', () =>
   assert.equal(entry.synthesisFailureAgeMin, 25);
 });
 
+// #5947: a MISSING_CLUSTER rejection has two opposite causes and health used to
+// relay the code without the count that tells them apart. These pin the field
+// that makes a recurrence diagnosable from the health response alone.
+test('classifyKey: insights MISSING_CLUSTER with eligible clusters exposes the selection-bug signature', () => {
+  const entry = classifyNewsInsights({
+    fetchedAt: NOW - 5 * ONE_MIN_MS,
+    recordCount: 8,
+    lastAttemptAt: NOW - 2 * ONE_MIN_MS,
+    lastSuccessAt: NOW - 65 * ONE_MIN_MS,
+    servedGeneratedAt: '2026-08-01T06:30:39.268Z',
+    consecutiveFailures: 2,
+    lastSynthesisFailureCode: 'INSIGHTS_SYNTHESIS_MISSING_CLUSTER',
+    briefEligibleClusters: 11,
+  });
+
+  assert.equal(entry.lastSynthesisFailureCode, 'INSIGHTS_SYNTHESIS_MISSING_CLUSTER');
+  assert.equal(entry.briefEligibleClusters, 11, 'corroborated clusters existed — selection failed to surface one');
+});
+
+test('classifyKey: insights MISSING_CLUSTER on a bare corpus publishes zero, not an omission', () => {
+  const entry = classifyNewsInsights({
+    fetchedAt: NOW - 5 * ONE_MIN_MS,
+    recordCount: 8,
+    lastAttemptAt: NOW - 2 * ONE_MIN_MS,
+    lastSuccessAt: NOW - 65 * ONE_MIN_MS,
+    servedGeneratedAt: '2026-08-01T06:30:39.268Z',
+    consecutiveFailures: 2,
+    lastSynthesisFailureCode: 'INSIGHTS_SYNTHESIS_MISSING_CLUSTER',
+    briefEligibleClusters: 0,
+  });
+
+  assert.equal(entry.briefEligibleClusters, 0, 'the corpus genuinely had nothing corroborated to lead with');
+});
+
+test('classifyKey: absent brief-eligible telemetry is omitted rather than fabricated as zero', () => {
+  const entry = classifyNewsInsights({
+    fetchedAt: NOW - 5 * ONE_MIN_MS,
+    recordCount: 8,
+    lastAttemptAt: NOW - 2 * ONE_MIN_MS,
+    lastSuccessAt: NOW - 65 * ONE_MIN_MS,
+    servedGeneratedAt: '2026-08-01T06:30:39.268Z',
+    consecutiveFailures: 2,
+    lastSynthesisFailureCode: 'INSIGHTS_SYNTHESIS_MISSING_CLUSTER',
+  });
+
+  assert.ok(
+    !('briefEligibleClusters' in entry),
+    'a dropped stat must not read as a bare corpus',
+  );
+});
+
+test('classifyKey: non-count brief-eligible values are dropped, and a real count is bounded', () => {
+  for (const bad of [-1, 1.5, '11', null, {}]) {
+    const entry = classifyNewsInsights({
+      fetchedAt: NOW - 5 * ONE_MIN_MS,
+      recordCount: 8,
+      lastAttemptAt: NOW - 2 * ONE_MIN_MS,
+      lastSuccessAt: NOW - 65 * ONE_MIN_MS,
+      consecutiveFailures: 2,
+      lastSynthesisFailureCode: 'INSIGHTS_SYNTHESIS_MISSING_CLUSTER',
+      briefEligibleClusters: bad,
+    });
+    assert.ok(!('briefEligibleClusters' in entry), `non-count input ${String(bad)} must be dropped`);
+  }
+
+  const bounded = classifyNewsInsights({
+    fetchedAt: NOW - 5 * ONE_MIN_MS,
+    recordCount: 8,
+    lastAttemptAt: NOW - 2 * ONE_MIN_MS,
+    lastSuccessAt: NOW - 65 * ONE_MIN_MS,
+    consecutiveFailures: 2,
+    lastSynthesisFailureCode: 'INSIGHTS_SYNTHESIS_MISSING_CLUSTER',
+    briefEligibleClusters: 10_000,
+  });
+  assert.equal(bounded.briefEligibleClusters, 1000);
+});
+
 test('classifyKey: a fresh successful insights publication clears synthesis warning state', () => {
   const entry = classifyNewsInsights({
     fetchedAt: NOW - ONE_MIN_MS,

@@ -2047,6 +2047,21 @@ function readSeedMeta(seedCfg, keyMetaValues, keyMetaErrors, now) {
       && meta.servedGeneratedAt.length <= 64
       ? meta.servedGeneratedAt
       : null;
+    // #5947: the one field that separates the two very different worlds behind
+    // a MISSING_CLUSTER rejection — 0 means the corpus genuinely had nothing
+    // corroborated to lead with (legitimately degraded, self-healing), while
+    // >0 means selection failed to surface a cluster that existed, which is the
+    // production incident that issue tracked. Without it an operator reading
+    // health sees the code and cannot tell a quiet news cycle from a recurrence.
+    //
+    // Absent telemetry stays null and is NOT published below, mirroring the
+    // producer's own normalizeBriefEligibleClusters: substituting 0 would make a
+    // dropped stat read exactly like a bare corpus. Bounded like the producer
+    // bounds it (1000) — health echoes this to operators.
+    const briefEligibleClusters = Number.isInteger(meta?.briefEligibleClusters)
+      && meta.briefEligibleClusters >= 0
+      ? Math.min(meta.briefEligibleClusters, 1000)
+      : null;
     const warning = consecutiveFailures > 0 && (
       consecutiveFailures >= seedCfg.synthesisFailure.warnAfterConsecutive
       || (synthesisFailureAgeMin != null
@@ -2060,6 +2075,7 @@ function readSeedMeta(seedCfg, keyMetaValues, keyMetaErrors, now) {
       servedGeneratedAt,
       synthesisFailureAgeMin,
       lastSynthesisFailureCode,
+      briefEligibleClusters,
       warning,
     };
   }
@@ -2477,6 +2493,12 @@ function classifyKey(name, redisKey, opts, ctx) {
       entry.lastSuccessAt = synthesisFailure.lastSuccessAt;
     }
     if (synthesisFailure.servedGeneratedAt != null) entry.servedGeneratedAt = synthesisFailure.servedGeneratedAt;
+    // Published whenever the producer recorded it, like the rest of the
+    // synthesis diagnostics — including on a healthy run, where it is the
+    // baseline that makes a later 0 readable as a change rather than a floor.
+    if (synthesisFailure.briefEligibleClusters != null) {
+      entry.briefEligibleClusters = synthesisFailure.briefEligibleClusters;
+    }
     if (synthesisFailure.synthesisFailureAgeMin != null && synthesisFailure.consecutiveFailures > 0) {
       entry.synthesisFailureAgeMin = synthesisFailure.synthesisFailureAgeMin;
     }
