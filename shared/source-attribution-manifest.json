@@ -12652,6 +12652,9 @@
         },
         {
           "path": "scripts/seed-conflict-intel.mjs"
+        },
+        {
+          "path": "scripts/seed-pizzint.mjs"
         }
       ]
     },
