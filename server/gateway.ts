@@ -15,6 +15,7 @@ import { isPublicSharedRpcRequest } from '../src/shared/public-rpc-cache';
 import { PRO_FRESH_CACHE_RPC_PATHS } from '../src/shared/pro-fresh-rpc';
 // @ts-expect-error — JS module, no declaration file
 import { USER_API_KEY_GATEWAY_VALIDATION_ERROR, validateApiKey } from '../api/_api-key.js';
+import { CLIENT_ID_HEADER, verifyClientAttestation } from './_shared/client-attestation';
 // @ts-expect-error — JS module, no declaration file
 import { timingSafeEqualSecret } from '../api/_crypto.js';
 // @ts-expect-error — JS module, no declaration file
@@ -997,6 +998,44 @@ export function createDomainGateway(
           }
         }
         request = new Request(request.url, reInit);
+      }
+    }
+
+    // ----------------------------------------------------------------------
+    // Client attestation — first-party app marker.
+    //
+    // Present-but-invalid is a forge attempt and is refused, exactly as the
+    // internal-MCP path below reasons: falling through would let a caller
+    // claim to be the app and then be judged as an anonymous one anyway,
+    // which makes the marker meaningless.
+    //
+    // Absent is NOT refused. This header grants no privilege — it only says
+    // which client is calling — so a caller that omits it simply gets the
+    // ordinary public surface. That is the whole difference from the
+    // internal-MCP header, which unlocks Pro context and therefore must fail
+    // closed.
+    //
+    // An unset secret SKIPS verification rather than 500ing, for the same
+    // reason: the internal-MCP path 500s because the caller reached for a
+    // privileged route that cannot be served without the secret, whereas
+    // here a missing env var would turn every first-party request into an
+    // outage while protecting nothing.
+    //
+    // The signing secret ships inside the app binary, so this is friction
+    // rather than proof — see server/_shared/client-attestation.ts. Nothing
+    // downstream may treat a verified marker as authority.
+    // ----------------------------------------------------------------------
+    if (request.headers.has(CLIENT_ID_HEADER)) {
+      const clientAttestationSecret = process.env.WM_CLIENT_ATTESTATION_SECRET ?? '';
+      if (clientAttestationSecret) {
+        const attested = await verifyClientAttestation(request, clientAttestationSecret);
+        if (!attested.ok) {
+          emitRequest(403, 'auth_401', null);
+          return new Response(
+            JSON.stringify({ error: 'Forbidden', detail: `client attestation ${attested.reason}` }),
+            { status: 403, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
+          );
+        }
       }
     }
 
