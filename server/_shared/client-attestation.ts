@@ -78,6 +78,13 @@ export async function verifyClientAttestation(
   secret: string,
   nowMs: number = Date.now(),
 ): Promise<ClientAttestation> {
+  // Trimmed because this arrives from an env var a human pasted into a
+  // dashboard, and a trailing newline there produces a signature that differs
+  // from the client's in a way nothing reports: the caller just sees
+  // "mismatch", which reads as a wrong secret rather than an invisible one.
+  // A secret with meaningful leading or trailing whitespace is not a thing.
+  const key = secret.trim();
+  if (!key) return { ok: false, reason: 'malformed' };
   const clientId = (request.headers.get(CLIENT_ID_HEADER) ?? '').trim().toLowerCase();
   const raw = (request.headers.get(CLIENT_SIGNATURE_HEADER) ?? '').trim();
   if (!clientId || clientId.length > MAX_CLIENT_ID_LENGTH || !raw) return { ok: false, reason: 'malformed' };
@@ -99,7 +106,7 @@ export async function verifyClientAttestation(
 
   const url = new URL(request.url);
   const expected = await hmacSha256Base64Url(
-    secret,
+    key,
     clientAttestationPayload(clientId, unixSeconds, request.method, url.pathname, url),
   );
   if (!equalsConstantTime(expected, provided)) return { ok: false, reason: 'mismatch' };

@@ -98,6 +98,24 @@ describe('verifyClientAttestation', () => {
     }
   });
 
+  // The secret comes from an env var someone pasted into a dashboard; a
+  // trailing newline there produced a bare "mismatch", which reads as the wrong
+  // secret rather than an invisible character.
+  it('tolerates whitespace around the configured secret', async () => {
+    const req = await signed();
+    for (const padded of [`${SECRET}\n`, ` ${SECRET} `, `\n${SECRET}\r\n`]) {
+      assert.equal((await verifyClientAttestation(req, padded, NOW_MS)).ok, true,
+        `padded secret ${JSON.stringify(padded)} must still verify`);
+    }
+  });
+
+  it('refuses everything when no secret is configured', async () => {
+    const req = await signed();
+    for (const empty of ['', '   ', '\n']) {
+      assert.equal((await verifyClientAttestation(req, empty, NOW_MS)).ok, false);
+    }
+  });
+
   it('normalises the client id case rather than rejecting the caller', async () => {
     const req = await signed({ clientId: 'ios' });
     const upper = new Request(req.url, {
