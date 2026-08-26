@@ -283,7 +283,14 @@ export async function summarizeArticle(
               { role: 'user', content: userPrompt },
             ],
             temperature: 0.3,
-            max_tokens: 100,
+            // A reasoning model bills its thinking against this same ceiling.
+            // At 100 the Groq dashboard showed every gpt-oss-20b call returning
+            // completion_tokens exactly 100 — the cap — with empty content: the
+            // reasoning consumed the whole budget before a word of the answer.
+            // The summary itself cannot grow to fill this; the prompt caps it at
+            // two sentences and a non-reasoning model still stops where it
+            // stopped before. Only the thinking has room now.
+            max_tokens: 400,
             top_p: 0.9,
             ...extraBody,
           }),
