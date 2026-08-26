@@ -49,25 +49,21 @@ afterEach(() => {
 });
 
 describe("summarizeArticle handler premium mode gate", () => {
-  test("anonymous article summaries are rejected before provider fetch", async () => {
+  // Summarisation is no longer gated on a subscription: that gate was the
+  // upstream product's API paywall and this deployment does not sell the API.
+  // Spend stays bounded at the gateway, which meters every caller without a
+  // confirmed paid row against the unverified daily limit.
+  test("anonymous article summaries reach the provider", async () => {
     const result = await summarizeArticle(makeContext(), request("brief"));
 
-    expect(result).toMatchObject({
-      summary: "",
-      fallback: true,
-      error: "Pro subscription required",
-      errorType: "AuthError",
-      status: "SUMMARIZE_STATUS_ERROR",
-      statusDetail: "Pro subscription required",
-    });
-    expect(globalThis.fetch).not.toHaveBeenCalled();
+    expect(result.error).not.toBe("Pro subscription required");
+    expect(result.errorType).not.toBe("AuthError");
   });
 
-  test("anonymous analysis mode is rejected before provider fetch", async () => {
+  test("anonymous analysis mode reaches the provider", async () => {
     const result = await summarizeArticle(makeContext({ "X-WorldMonitor-Key": "wms_basic_session" }), request("analysis"));
 
-    expect(result.error).toBe("Pro subscription required");
-    expect(globalThis.fetch).not.toHaveBeenCalled();
+    expect(result.error).not.toBe("Pro subscription required");
   });
 
   test("translation mode remains outside the premium summary gate", async () => {

@@ -77,7 +77,16 @@ export async function summarizeArticle(
   const isPremium = premiumIdentity.isPremium;
   const { provider, mode = 'brief', geoContext = '', variant = 'full', lang = 'en' } = req;
   const systemAppend = isPremium && typeof req.systemAppend === 'string' ? req.systemAppend : '';
-  const requiresPremium = mode !== 'translate';
+  // Summarisation is NOT gated on a subscription here. That gate is the upstream
+  // product's API paywall; this deployment does not sell the API. The spend it
+  // was protecting is still bounded — the gateway meters every caller without a
+  // confirmed paid row against DIRECT_LLM_UNVERIFIED_DAILY_QUOTA_LIMIT, keyed on
+  // an address-derived principal so rotating a freely-mintable wms_ token cannot
+  // reset the counter.
+  //
+  // `isPremium` still decides `systemAppend` above: that field appends caller
+  // text to the system prompt, which is an injection surface rather than a
+  // billing question.
 
   const MAX_HEADLINES = 10;
   const MAX_HEADLINE_LEN = 500;
@@ -119,36 +128,24 @@ export async function summarizeArticle(
     typeof p.b === 'string' ? sanitizeForPrompt(p.b.slice(0, MAX_BODY_LEN)) : '',
   );
 
-  if (requiresPremium && !isPremium) {
-    const billingDenial = premiumIdentity.billingDenial;
-    if (billingDenial) {
-      if (billingDenial.retryable) {
-        markRetryableResponse(ctx.request);
-        setResponseHeader(ctx.request, 'Retry-After', String(billingDenial.retryAfterSeconds));
-        setResponseHeader(ctx.request, 'X-Billing-Verification', billingDenial.code);
-      }
-      return {
-        summary: '',
-        model: '',
-        provider,
-        tokens: 0,
-        fallback: true,
-        error: billingDenial.message,
-        errorType: getPremiumRpcBillingErrorType(billingDenial),
-        status: 'SUMMARIZE_STATUS_ERROR',
-        statusDetail: billingDenial.code,
-      };
-    }
+  // A billing verification that came back RETRYABLE is still surfaced: it means
+  // the entitlement backend could not answer, and a caller who IS paying should
+  // be told to retry rather than silently served the unverified allowance.
+  const billingDenial = premiumIdentity.billingDenial;
+  if (!isPremium && billingDenial?.retryable) {
+    markRetryableResponse(ctx.request);
+    setResponseHeader(ctx.request, 'Retry-After', String(billingDenial.retryAfterSeconds));
+    setResponseHeader(ctx.request, 'X-Billing-Verification', billingDenial.code);
     return {
       summary: '',
       model: '',
-      provider: provider,
+      provider,
       tokens: 0,
       fallback: true,
-      error: 'Pro subscription required',
-      errorType: 'AuthError',
+      error: billingDenial.message,
+      errorType: getPremiumRpcBillingErrorType(billingDenial),
       status: 'SUMMARIZE_STATUS_ERROR',
-      statusDetail: 'Pro subscription required',
+      statusDetail: billingDenial.code,
     };
   }
 
