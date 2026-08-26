@@ -1032,7 +1032,11 @@ export function createDomainGateway(
         if (!attested.ok) {
           emitRequest(403, 'auth_401', null);
           return new Response(
-            JSON.stringify({ error: 'Forbidden', detail: `client attestation ${attested.reason}` }),
+            JSON.stringify({
+              error: 'Forbidden',
+              detail: `client attestation ${attested.reason}`,
+              ...(attested.configFingerprint ? { configFingerprint: attested.configFingerprint } : {}),
+            }),
             {
               status: 403,
               headers: {

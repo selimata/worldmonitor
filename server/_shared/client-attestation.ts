@@ -25,7 +25,7 @@
  * marker, not an integrity check, and hashing every upload to re-sign it would
  * cost more than the property is worth.
  */
-import { canonicalQueryString, hmacSha256Base64Url } from './mcp-internal-hmac';
+import { canonicalQueryString, hmacSha256Base64Url, sha256Hex } from './mcp-internal-hmac';
 
 /** Names the claimed client, e.g. `ios`. Presence is what arms verification. */
 export const CLIENT_ID_HEADER = 'X-WM-Client';
@@ -47,7 +47,7 @@ const CLIENT_ID_SHAPE = /^[a-z0-9][a-z0-9-]{0,31}$/;
 
 export type ClientAttestation =
   | { ok: true; clientId: string }
-  | { ok: false; reason: 'malformed' | 'bad-client-id' | 'stale' | 'mismatch' };
+  | { ok: false; reason: 'malformed' | 'bad-client-id' | 'stale' | 'mismatch'; configFingerprint?: string };
 
 export function clientAttestationPayload(
   clientId: string,
@@ -63,6 +63,23 @@ export function clientAttestationPayload(
     pathname,
     canonicalQueryString(search),
   ].join('\n');
+}
+
+/**
+ * Eight hex characters of SHA-256 over the CONFIGURED secret, attached only to a
+ * mismatch. It exists because the failure it explains is otherwise undiagnosable
+ * from outside: a correct client, a correct value in the dashboard and a running
+ * deployment built against a different one all look identical, and the only way
+ * to tell them apart was to guess. Comparing this against the fingerprint of the
+ * value you believe is set answers it in one request.
+ *
+ * Safe to return: the secret is 256 bits of randomness, so a 32-bit digest
+ * prefix confirms a candidate someone already holds and reveals nothing to
+ * anyone who does not. It also grants no access — this whole marker is
+ * attribution, never authority.
+ */
+async function secretFingerprint(secret: string): Promise<string> {
+  return (await sha256Hex(secret)).slice(0, 8);
 }
 
 /** Compare without leaking, through timing, how much of the signature matched. */
@@ -109,6 +126,6 @@ export async function verifyClientAttestation(
     key,
     clientAttestationPayload(clientId, unixSeconds, request.method, url.pathname, url),
   );
-  if (!equalsConstantTime(expected, provided)) return { ok: false, reason: 'mismatch' };
+  if (!equalsConstantTime(expected, provided)) return { ok: false, reason: 'mismatch', configFingerprint: await secretFingerprint(key) };
   return { ok: true, clientId };
 }

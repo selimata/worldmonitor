@@ -31,6 +31,15 @@ async function signed(opts: {
   });
 }
 
+// A mismatch also carries a fingerprint of the CONFIGURED secret, so assert the
+// shape rather than deep-equality: the fingerprint is the field that tells a
+// wrong-secret deploy apart from a wrong client, and it must actually be there.
+function assertMismatch(result: Awaited<ReturnType<typeof verifyClientAttestation>>): void {
+  assert.equal(result.ok, false);
+  assert.equal(result.ok === false && result.reason, 'mismatch');
+  assert.match(result.ok === false ? result.configFingerprint ?? '' : '', /^[0-9a-f]{8}$/);
+}
+
 describe('verifyClientAttestation', () => {
   it('accepts a signature this secret produced', async () => {
     assert.deepEqual(await verifyClientAttestation(await signed(), SECRET, NOW_MS),
@@ -39,7 +48,7 @@ describe('verifyClientAttestation', () => {
 
   it('refuses a signature from a different secret', async () => {
     const req = await signed({ secret: 'someone-elses-secret-value-32-chars!' });
-    assert.deepEqual(await verifyClientAttestation(req, SECRET, NOW_MS), { ok: false, reason: 'mismatch' });
+    assertMismatch(await verifyClientAttestation(req, SECRET, NOW_MS));
   });
 
   // The point of binding method and path: a header pair captured from one call
@@ -47,13 +56,13 @@ describe('verifyClientAttestation', () => {
   it('refuses a signature replayed onto a different path', async () => {
     const req = await signed({ url: 'https://example.test/api/a' });
     const moved = new Request('https://example.test/api/b', { method: 'GET', headers: req.headers });
-    assert.deepEqual(await verifyClientAttestation(moved, SECRET, NOW_MS), { ok: false, reason: 'mismatch' });
+    assertMismatch(await verifyClientAttestation(moved, SECRET, NOW_MS));
   });
 
   it('refuses a signature replayed onto a different method', async () => {
     const req = await signed({ method: 'GET' });
     const moved = new Request(req.url, { method: 'POST', headers: req.headers });
-    assert.deepEqual(await verifyClientAttestation(moved, SECRET, NOW_MS), { ok: false, reason: 'mismatch' });
+    assertMismatch(await verifyClientAttestation(moved, SECRET, NOW_MS));
   });
 
   it('tolerates ordinary handset clock drift', async () => {
@@ -80,7 +89,7 @@ describe('verifyClientAttestation', () => {
   it('still binds query VALUES', async () => {
     const req = await signed({ url: 'https://example.test/api/x?id=1' });
     const tampered = new Request('https://example.test/api/x?id=2', { method: 'GET', headers: req.headers });
-    assert.deepEqual(await verifyClientAttestation(tampered, SECRET, NOW_MS), { ok: false, reason: 'mismatch' });
+    assertMismatch(await verifyClientAttestation(tampered, SECRET, NOW_MS));
   });
 
   it('rejects malformed and hostile header shapes without throwing', async () => {
