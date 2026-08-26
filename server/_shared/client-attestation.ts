@@ -45,6 +45,31 @@ export const CLIENT_TIMESTAMP_WINDOW_SECONDS = 300;
 const MAX_CLIENT_ID_LENGTH = 32;
 const CLIENT_ID_SHAPE = /^[a-z0-9][a-z0-9-]{0,31}$/;
 
+/**
+ * Query keys the PLATFORM adds, which the client never sent and cannot sign.
+ *
+ * Every domain gateway is served from a dynamic route (`api/<domain>/v1/[rpc].ts`),
+ * and Vercel surfaces the matched segment to the function as a query parameter.
+ * A caller signing `?variant=full&lang=en` is therefore verified against
+ * `?lang=en&rpc=list-feed-digest&variant=full`, and every signed request fails.
+ * Seen in production 2026-08-26: `observed` reported exactly that extra key.
+ *
+ * Dropped only when the value equals the last path segment — that is what makes
+ * it the platform's echo of the route rather than a parameter the caller chose,
+ * so a genuine `?rpc=` from a client is still bound by the signature.
+ */
+const PLATFORM_INJECTED_QUERY_KEYS = new Set(['rpc']);
+
+/** The canonical query as the CLIENT saw it, with the platform's echo removed. */
+export function clientCanonicalQuery(url: URL): string {
+  const lastSegment = url.pathname.split('/').filter(Boolean).pop() ?? '';
+  const params = new URLSearchParams(url.search);
+  for (const key of PLATFORM_INJECTED_QUERY_KEYS) {
+    if (params.get(key) === lastSegment) params.delete(key);
+  }
+  return canonicalQueryString(params.toString());
+}
+
 export type ClientAttestation =
   | { ok: true; clientId: string }
   | { ok: false; reason: 'malformed' | 'bad-client-id' | 'stale' | 'mismatch'; configFingerprint?: string; observed?: string };
@@ -124,7 +149,7 @@ export async function verifyClientAttestation(
   const url = new URL(request.url);
   const expected = await hmacSha256Base64Url(
     key,
-    clientAttestationPayload(clientId, unixSeconds, request.method, url.pathname, url),
+    clientAttestationPayload(clientId, unixSeconds, request.method, url.pathname, clientCanonicalQuery(url)),
   );
   if (!equalsConstantTime(expected, provided)) {
     return {
@@ -137,7 +162,7 @@ export async function verifyClientAttestation(
       // a proxy that rewrote the path, a query the edge added, a host that
       // changed what `request.url` reports. Without it both ends look correct
       // and only the digests differ.
-      observed: `${request.method.toUpperCase()} ${url.pathname} ?${canonicalQueryString(url)}`,
+      observed: `${request.method.toUpperCase()} ${url.pathname} ?${clientCanonicalQuery(url)}`,
     };
   }
   return { ok: true, clientId };

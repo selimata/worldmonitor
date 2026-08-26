@@ -125,6 +125,31 @@ describe('verifyClientAttestation', () => {
     }
   });
 
+  // Production 2026-08-26: every signed request 403'd because Vercel serves each
+  // domain gateway from api/<domain>/v1/[rpc].ts and hands the matched segment to
+  // the function as a query parameter. The client signs the query it sent; the
+  // server saw an extra `rpc=` it could never have signed.
+  it('ignores the route parameter the platform injects', async () => {
+    const req = await signed({ url: 'https://example.test/api/news/v1/list-feed-digest?variant=full&lang=en' });
+    const asVercelSeesIt = new Request(
+      'https://example.test/api/news/v1/list-feed-digest?variant=full&lang=en&rpc=list-feed-digest',
+      { method: 'GET', headers: req.headers },
+    );
+    assert.equal((await verifyClientAttestation(asVercelSeesIt, SECRET, NOW_MS)).ok, true);
+  });
+
+  // The exemption is narrow on purpose: it is the platform's echo of the route
+  // only when the value IS the route. Anything else a caller puts in `rpc` stays
+  // signed, or the filter would become a hole to smuggle a parameter through.
+  it('still binds an rpc parameter that is not the route echo', async () => {
+    const req = await signed({ url: 'https://example.test/api/news/v1/list-feed-digest?variant=full' });
+    const tampered = new Request(
+      'https://example.test/api/news/v1/list-feed-digest?variant=full&rpc=something-else',
+      { method: 'GET', headers: req.headers },
+    );
+    assertMismatch(await verifyClientAttestation(tampered, SECRET, NOW_MS));
+  });
+
   it('normalises the client id case rather than rejecting the caller', async () => {
     const req = await signed({ clientId: 'ios' });
     const upper = new Request(req.url, {
