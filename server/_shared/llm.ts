@@ -116,6 +116,18 @@ export function getProviderCredentials(
         'Authorization': `Bearer ${apiKey}`,
         'Content-Type': 'application/json',
       },
+      // GROQ_DEFAULT_MODEL (openai/gpt-oss-*) is a reasoning model: left alone
+      // it spends the whole max_tokens budget on reasoning tokens and returns
+      // finish_reason "length" with an EMPTY message.content — which reached
+      // summarize-article as "Output too short after stripping (0 chars)" and
+      // read as a dead provider rather than a missing parameter. Groq has no
+      // equivalent of OpenRouter's reasoning.enabled:false; the only lever is
+      // reasoning_effort, and the API rejects "none" (low|medium|high only).
+      //
+      // scripts/seed-insights.mjs has carried this since it hit the same wall;
+      // this path never got it, so every server-side groq summary came back
+      // empty while the identical model answered fine from the seeder.
+      extraBody: { reasoning_effort: 'low' },
     };
   }
 
