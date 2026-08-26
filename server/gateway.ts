@@ -1036,6 +1036,7 @@ export function createDomainGateway(
               error: 'Forbidden',
               detail: `client attestation ${attested.reason}`,
               ...(attested.configFingerprint ? { configFingerprint: attested.configFingerprint } : {}),
+              ...(attested.observed ? { observed: attested.observed } : {}),
             }),
             {
               status: 403,

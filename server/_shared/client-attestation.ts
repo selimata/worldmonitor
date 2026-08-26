@@ -47,7 +47,7 @@ const CLIENT_ID_SHAPE = /^[a-z0-9][a-z0-9-]{0,31}$/;
 
 export type ClientAttestation =
   | { ok: true; clientId: string }
-  | { ok: false; reason: 'malformed' | 'bad-client-id' | 'stale' | 'mismatch'; configFingerprint?: string };
+  | { ok: false; reason: 'malformed' | 'bad-client-id' | 'stale' | 'mismatch'; configFingerprint?: string; observed?: string };
 
 export function clientAttestationPayload(
   clientId: string,
@@ -126,6 +126,19 @@ export async function verifyClientAttestation(
     key,
     clientAttestationPayload(clientId, unixSeconds, request.method, url.pathname, url),
   );
-  if (!equalsConstantTime(expected, provided)) return { ok: false, reason: 'mismatch', configFingerprint: await secretFingerprint(key) };
+  if (!equalsConstantTime(expected, provided)) {
+    return {
+      ok: false,
+      reason: 'mismatch',
+      configFingerprint: await secretFingerprint(key),
+      // The payload the server signed, echoed back. It carries no secret —
+      // method, path and query are the caller's own request — and it is the
+      // only way to see a disagreement the two sides cannot otherwise compare:
+      // a proxy that rewrote the path, a query the edge added, a host that
+      // changed what `request.url` reports. Without it both ends look correct
+      // and only the digests differ.
+      observed: `${request.method.toUpperCase()} ${url.pathname} ?${canonicalQueryString(url)}`,
+    };
+  }
   return { ok: true, clientId };
 }
