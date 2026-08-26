@@ -128,7 +128,7 @@ describe("summarize-article gateway spend controls", () => {
     expect(ENDPOINT_RATE_POLICIES[SUMMARIZE_PATH]).toEqual({ limit: 30, window: "60 s" });
   });
 
-  test("anonymous wms_ sessions cannot reach non-translate summarize handler spend", async () => {
+  test("anonymous wms_ sessions are metered, not refused, on non-translate summarize", async () => {
     validateApiKey.mockResolvedValue({ valid: true, required: false, kind: "session" });
     const calls = { summarize: 0, cache: 0 };
 
@@ -137,14 +137,18 @@ describe("summarize-article gateway spend controls", () => {
       { waitUntil: () => {} },
     );
 
-    expect(res.status).toBe(401);
-    expect(calls.summarize).toBe(0);
+    // This endpoint spends real provider budget, so an anonymous caller is
+    // capped rather than turned away: the quota principal is derived from the
+    // address, never from the freely mintable wms_ token, and the daily limit
+    // is the unverified floor.
+    expect(res.status).toBe(200);
+    expect(calls.summarize).toBe(1);
     expect(checkEndpointRateLimit).toHaveBeenCalledWith(
       expect.any(Request),
       SUMMARIZE_PATH,
       expect.any(Object),
     );
-    expect(reserveDirectLlmQuota).not.toHaveBeenCalled();
+    expect(reserveDirectLlmQuota).toHaveBeenCalled();
   });
 
   test("basic bearer sessions also pass through the scoped endpoint limiter", async () => {
@@ -399,10 +403,12 @@ describe("summarize-article gateway spend controls", () => {
       { waitUntil: () => {} },
     );
 
-    expect(res.status).toBe(401);
+    // The non-translate call above is now metered rather than refused, so it
+    // reserves once; translate must still reserve nothing.
+    expect(res.status).toBe(200);
     expect(translate.status).toBe(200);
-    expect(calls.summarize).toBe(1);
-    expect(reserveDirectLlmQuota).not.toHaveBeenCalled();
+    expect(calls.summarize).toBe(2);
+    expect(reserveDirectLlmQuota).toHaveBeenCalledTimes(1);
   });
 
   test("Redis-degraded endpoint rate limiting fails closed before the provider handler", async () => {

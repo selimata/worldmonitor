@@ -1976,11 +1976,20 @@ export function createDomainGateway(
       const dockerQuotaUserId = dockerSelfHostSessionAuthorized
         ? `docker:${hashKeySync(deriveIp(request) ?? 'unknown')}`
         : null;
-      const quotaUserId = sessionUserId ?? dockerQuotaUserId;
-      if (!quotaUserId) {
-        emitRequest(401, 'auth_401', null);
-        return createGatewayAuthErrorResponse(401, 'Pro authentication required', corsHeaders);
-      }
+      // Anonymous callers are metered rather than refused. The principal is
+      // derived the same way the Docker one is — from the address, never from
+      // the token — for the same reason: a wms_ session is freely mintable via
+      // POST /api/wm-session, so a token-keyed counter would reset on rotation
+      // and meter nothing. An address we cannot read collapses to one shared
+      // 'unknown' bucket, which fails toward less spend, not more.
+      //
+      // This does NOT widen the allowance: directLlmDailyLimit below already
+      // sends every principal without a confirmed paid row to
+      // DIRECT_LLM_UNVERIFIED_DAILY_QUOTA_LIMIT, so an anonymous caller gets
+      // that floor and nothing else. The reservation, the daily cap and the
+      // rollback path are all unchanged.
+      const anonymousQuotaUserId = `anon:${hashKeySync(deriveIp(request) ?? 'unknown')}`;
+      const quotaUserId = sessionUserId ?? dockerQuotaUserId ?? anonymousQuotaUserId;
 
       // Tier-1 legacy Clerk-role grants intentionally bypass the ordinary
       // entitlement lookup. Re-read the cached row when available so Pro
