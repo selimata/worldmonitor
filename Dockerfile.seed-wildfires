@@ -1,0 +1,60 @@
+# =============================================================================
+# wildfire:fires seed cron
+# =============================================================================
+# Runs scripts/seed-fire-detections.mjs as a Railway cron. Publishes
+# `wildfire:fires:v1` and the compact `wildfire:fires-bootstrap:v1` that
+# server/worldmonitor/wildfire/v1/list-fire-detections.ts reads. With neither
+# key present the handler answers `dataAvailable: false`, which the iOS
+# Overview correctly renders as "no reading" rather than "no fires" — but the
+# card stays blank until something writes them.
+#
+# The script documents this service in its own header comment; it had simply
+# never been created, which is why the WILDFIRE tile was empty. Every other
+# standalone scripts/seed-*.mjs is in the same position.
+#
+# Cadence: `*/10 * * * *`, matching seed-pizzint. The payload TTL is 7200s and
+# runSeed's own lockTtlMs is 40 min for the 27 FIRMS region/source slots, so a
+# tick that finds the lock held skips safely; a slower schedule would let the
+# key expire between runs.
+#
+# Installs nothing: the import graph is Node builtins plus the files COPY'd
+# below, computed as the transitive closure of relative imports from the entry
+# point.
+#
+# Required env (Railway service vars):
+#   UPSTASH_REDIS_REST_URL
+#   UPSTASH_REDIS_REST_TOKEN
+#   NASA_FIRMS_API_KEY   — optional in the sense that the run still succeeds
+#                          without it, but every FIRMS region fails and the
+#                          payload falls back to the Canadian sources alone.
+# =============================================================================
+
+FROM node:24-alpine@sha256:d32cdf619f63fe0471182d08996dd516c6275bb5fd31ae06e55a570bd9e1ad43
+
+WORKDIR /app
+
+RUN printf '{"type":"module","private":true}\n' > /app/package.json
+
+COPY scripts/seed-fire-detections.mjs ./scripts/
+COPY scripts/_seed-utils.mjs ./scripts/
+COPY scripts/_seed-contract.mjs ./scripts/
+COPY scripts/_seed-envelope-source.mjs ./scripts/
+COPY scripts/_wildfire-dashboard.mjs ./scripts/
+
+# The two Canadian sources the entry point merges with FIRMS. They are the only
+# thing that answered at all on the last manual run — every FIRMS slot failed —
+# so leaving them out would empty the payload rather than merely narrow it.
+COPY scripts/wildfire/cwfis-wfs.mjs ./scripts/wildfire/
+COPY scripts/wildfire/bc-fire-points.mjs ./scripts/wildfire/
+
+# Reached through createRequire(import.meta.url) in _seed-utils.mjs, so no
+# static-import scan lists it. Omitting it fails at MODULE_NOT_FOUND on the
+# first import — immediately, on every run.
+COPY scripts/_proxy-utils.cjs ./scripts/
+
+# _seed-utils.mjs imports this for its run telemetry. Copied as a single file
+# rather than the whole lib/ directory: nothing else under lib/ is reachable
+# from this entry point.
+COPY scripts/lib/llm-telemetry.cjs ./scripts/lib/
+
+CMD ["node", "scripts/seed-fire-detections.mjs"]
