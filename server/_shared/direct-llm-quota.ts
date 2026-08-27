@@ -22,7 +22,18 @@ export const DIRECT_LLM_REDIS_UNAVAILABLE_RETRY_AFTER_SECONDS = 30;
  * callers before the handler runs. Keeping it non-zero is what stops an
  * entitlement-service outage from 429-ing paying customers.
  */
-export const DIRECT_LLM_UNVERIFIED_DAILY_QUOTA_LIMIT = 50;
+/**
+ * Overridable because a deployment that gates Pro in the client — ours, via
+ * RevenueCat — cannot prove a subscriber to the gateway, so every reader lands
+ * here, paying ones included. 50 is right for a public web dashboard where
+ * anonymous means anonymous; it is wrong for an app whose paying users share
+ * that ceiling between article summaries and country briefs and hit it in an
+ * afternoon. A non-numeric or non-positive value keeps the default.
+ */
+export const DIRECT_LLM_UNVERIFIED_DAILY_QUOTA_LIMIT = (() => {
+  const raw = Number(process.env.WM_DIRECT_LLM_UNVERIFIED_DAILY_LIMIT ?? '');
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 50;
+})();
 
 export type DirectLlmEntitlementShape = {
   features?: {
