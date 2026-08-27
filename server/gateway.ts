@@ -1252,10 +1252,20 @@ export function createDomainGateway(
     // proof remains the gateway authentication boundary on this one route.
     // Cloud deployments do not set LOCAL_API_MODE=docker, and every other
     // premium route retains forceKey + entitlement enforcement below.
-    const isDockerSelfHostCountryBrief =
+    //
+    // WM_COUNTRY_BRIEF_PUBLIC extends the same exemption to a hosted deployment
+    // that likewise has no entitlement backend. Ours gates Pro in the app via
+    // RevenueCat, which the gateway cannot verify — so a paying reader presents
+    // the same anonymous session as everyone else and forceKey rejected all of
+    // them, subscriber included. Opening the route is the deliberate trade: the
+    // paywall stays client-side, and spend stays bounded by the direct-LLM
+    // quota this path already reserves, plus the shared per-country cache entry
+    // anonymous callers get instead of a personalised one.
+    const isCountryBriefPublic =
       request.method === 'GET' &&
       pathname === COUNTRY_INTEL_BRIEF_PATH &&
-      process.env.LOCAL_API_MODE === 'docker';
+      (process.env.LOCAL_API_MODE === 'docker' ||
+        process.env.WM_COUNTRY_BRIEF_PUBLIC === '1');
     const needsLegacyProBearerGate = !internalMcpVerified && !isPublicNoAuthRpc && PREMIUM_RPC_PATHS.has(pathname) && !isTierGated;
     const isProFreshCacheRpc = PRO_FRESH_CACHE_RPC_PATHS.has(pathname);
     const needsProFreshnessResolution =
@@ -1296,7 +1306,7 @@ export function createDomainGateway(
       ? { valid: true, required: false }
       : ((await validateApiKey(request, {
           forceKey: ((isTierGated && !sessionUserId) || needsLegacyProBearerGate)
-            && !isDockerSelfHostCountryBrief,
+            && !isCountryBriefPublic,
         })) as { valid: boolean; required: boolean; error?: string; kind?: 'enterprise' | 'session' | 'user'; credential?: string });
 
     // User-owned API keys (wm_ prefix): when the static WORLDMONITOR_VALID_KEYS
@@ -1311,11 +1321,19 @@ export function createDomainGateway(
       request.headers.get('X-WorldMonitor-Key') ??
       request.headers.get('X-Api-Key') ??
       '';
-    const dockerSelfHostSessionAuthorized =
-      isDockerSelfHostCountryBrief &&
+    const countryBriefSessionAuthorized =
+      isCountryBriefPublic &&
       keyCheck.valid &&
       !keyCheck.required &&
       keyCheck.kind === 'session';
+    // Spend attribution stays Docker-only. There the principal comes from
+    // nginx's trusted X-Real-IP; on a hosted deployment there is no nginx, so
+    // an opened brief falls through to the anonymous branch below and is
+    // metered by the address the platform reports — the same bucket every
+    // other unauthenticated caller uses, rather than a 'docker:' one that
+    // would name something this deployment does not run.
+    const dockerSelfHostSessionAuthorized =
+      countryBriefSessionAuthorized && process.env.LOCAL_API_MODE === 'docker';
     if (keyCheck.required && !keyCheck.valid && wmKey.startsWith('wm_')) {
       // Unknown wm_ credentials require a Convex-backed hash lookup before we
       // know the account principal. Bound that unattributed work by IP first:
@@ -1610,7 +1628,7 @@ export function createDomainGateway(
       && !isUserApiKey
       && keyCheck.kind === 'enterprise';
     if (
-      !dockerSelfHostSessionAuthorized &&
+      !countryBriefSessionAuthorized &&
       !isEnterpriseAuth &&
       !internalMcpVerified &&
       !seedRefreshVerified &&
