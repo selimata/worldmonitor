@@ -1477,13 +1477,19 @@ function orefCurlFetch(proxyAuth, url, { toFile } = {}) {
   // but curl's fingerprint passes. curl is available on Railway (Linux) and macOS.
   // execFileSync avoids shell interpolation — safe with special chars in proxy credentials.
   const { execFileSync } = require('child_process');
-  const proxyUrl = `http://${proxyAuth}`;
+  // No proxy configured means go direct, NOT `-x http://`. resolveProxyString
+  // returns '' when PROXY_URL is unset, which built exactly that: curl rejects
+  // it as a malformed proxy and every OREF fetch failed with a curl error the
+  // bootstrap reported three times before giving up on an empty history. The
+  // proxy is here for reach, not for the TLS fingerprint — that is curl's job —
+  // so a direct attempt is worth making.
   const args = [
-    '-sS', '--compressed', '-x', proxyUrl, '--max-time', '15',
+    '-sS', '--compressed', '--max-time', '15',
     '-H', 'Accept: application/json',
     '-H', 'Referer: https://www.oref.org.il/',
     '-H', 'X-Requested-With: XMLHttpRequest',
   ];
+  if (proxyAuth) args.splice(2, 0, '-x', `http://${proxyAuth}`);
   if (toFile) {
     // Write directly to disk — avoids stdout buffer overflow (ENOBUFS) for large responses
     args.push('-o', toFile);
