@@ -594,6 +594,13 @@
       "removal_issue": null
     },
     {
+      "path": "api/live-activity/register.js",
+      "category": "internal-helper",
+      "reason": "iOS Live Activity (APNs) push-token registration for the World Monitor app: a two-field write ({token, kind}) into the Redis token store that scripts/ais-relay.cjs reads when it pushes critical-alert Live Activities. Device-token plumbing for the relay's APNs sender, not a domain data RPC; same anonymous wms_ session gate as the other iOS edge routes, per-IP budget enforced in-handler via checkRateLimit.",
+      "owner": "@selimata",
+      "removal_issue": null
+    },
+    {
       "path": "api/wm-session.js",
       "category": "ops-admin",
       "reason": "Anonymous browser session-token mint. Single 2-field response ({token, exp}); a sebuf RPC would be over-engineering for an auth-bootstrap endpoint that the client calls once at boot. See PR #3557 / issue #3541 for the full bypass-closure rationale.",
