@@ -1,0 +1,354 @@
+'use strict';
+
+/**
+ * Live Activity dispatcher — decides WHEN to push (start / update / end) for
+ * CRITICAL news alerts detected by scripts/ais-relay.cjs, and keeps that
+ * decision durable in Redis so a relay restart never re-fires a start.
+ *
+ * Redis layout (keys are shared verbatim with api/live-activity/register.js —
+ * deliberately NOT prefixed with RELAY_ENV, the Vercel route writes them):
+ *
+ *   live-activity:push-to-start:v1            ZSET  token -> registeredAt ms
+ *   live-activity:update:v1:<alertId>         HASH  token -> registeredAt ms
+ *   live-activity:started:v1:<alertId>        STRING (SET NX, 6h) start dedupe
+ *   live-activity:active:v1                   STRING JSON of the ONE active alert
+ *
+ * Rules (see docs/live-activity-push.md):
+ *   - A critical alert that has not been started (no dedupe marker, no update
+ *     tokens) and was published within the start window -> push-to-start to
+ *     every registered push-to-start token. At most ONE active alert: starting
+ *     a new one ends the previous one first.
+ *   - The active alert gaining more related reports -> update to its update
+ *     tokens (registered by the iOS app once the activity is running).
+ *   - sweep(): end after LIVE_ACTIVITY_MAX_ACTIVE_MS, or when the alert has not
+ *     been observed as critical for LIVE_ACTIVITY_STALE_MS ("no longer critical").
+ *
+ * Every public method resolves — never rejects — so the relay hook stays a
+ * one-liner. Failures are logged and reported in the returned `action`.
+ */
+
+const { buildContentState, deriveAlertId, maskToken } = require('./apns-live-activity.cjs');
+
+const KEY_PUSH_TO_START = 'live-activity:push-to-start:v1';
+const KEY_ACTIVE = 'live-activity:active:v1';
+const KEY_UPDATE_PREFIX = 'live-activity:update:v1:';
+const KEY_STARTED_PREFIX = 'live-activity:started:v1:';
+
+const LIVE_ACTIVITY_MAX_ACTIVE_MS = 4 * 60 * 60 * 1000;
+const LIVE_ACTIVITY_STALE_MS = 60 * 60 * 1000;
+const LIVE_ACTIVITY_START_WINDOW_MS = 60 * 60 * 1000;
+const LIVE_ACTIVITY_STARTED_TTL_S = 6 * 60 * 60;
+const LIVE_ACTIVITY_ACTIVE_TTL_S = 5 * 60 * 60;
+const PUSH_TO_START_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const END_DISMISSAL_DELAY_S = 30 * 60;
+const SEND_CONCURRENCY = 8;
+
+function updateTokensKey(alertId) {
+  return `${KEY_UPDATE_PREFIX}${alertId}`;
+}
+
+function startedKey(alertId) {
+  return `${KEY_STARTED_PREFIX}${alertId}`;
+}
+
+/**
+ * Upstash REST client exposing raw Redis commands. Uses global fetch (Node >= 18)
+ * so it also works against the plain-http self-hosted proxy the relay supports.
+ */
+function createUpstashCommandClient({ url, token, fetchImpl = globalThis.fetch, timeoutMs = 5000 } = {}) {
+  const base = String(url || '').replace(/\/$/, '');
+  if (!base || !token) throw new Error('createUpstashCommandClient: url and token are required');
+
+  async function pipeline(commands) {
+    if (!Array.isArray(commands) || commands.length === 0) return [];
+    const resp = await fetchImpl(`${base}/pipeline`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(commands.map((cmd) => cmd.map((part) => String(part)))),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!resp.ok) throw new Error(`Upstash pipeline HTTP ${resp.status}`);
+    const entries = await resp.json();
+    if (!Array.isArray(entries) || entries.length !== commands.length) {
+      throw new Error('Upstash pipeline returned a malformed response');
+    }
+    return entries.map((entry, i) => {
+      if (entry && typeof entry === 'object' && entry.error) {
+        throw new Error(`Upstash ${commands[i][0]} failed: ${entry.error}`);
+      }
+      return entry?.result ?? null;
+    });
+  }
+
+  async function command(args) {
+    const [result] = await pipeline([args]);
+    return result;
+  }
+
+  return { command, pipeline };
+}
+
+async function mapWithConcurrency(items, limit, fn) {
+  const results = new Array(items.length);
+  let next = 0;
+  async function worker() {
+    while (next < items.length) {
+      const index = next++;
+      results[index] = await fn(items[index], index);
+    }
+  }
+  const workers = [];
+  for (let i = 0; i < Math.min(limit, items.length); i++) workers.push(worker());
+  await Promise.all(workers);
+  return results;
+}
+
+function createLiveActivityDispatcher({
+  redis,
+  sender,
+  log = console,
+  now = Date.now,
+  maxActiveMs = LIVE_ACTIVITY_MAX_ACTIVE_MS,
+  staleMs = LIVE_ACTIVITY_STALE_MS,
+  startWindowMs = LIVE_ACTIVITY_START_WINDOW_MS,
+  startedTtlS = LIVE_ACTIVITY_STARTED_TTL_S,
+  pushToStartTokenTtlMs = PUSH_TO_START_TOKEN_TTL_MS,
+} = {}) {
+  if (!redis || typeof redis.command !== 'function' || typeof redis.pipeline !== 'function') {
+    throw new TypeError('createLiveActivityDispatcher: redis client with command()/pipeline() is required');
+  }
+  if (!sender || typeof sender.sendStart !== 'function') {
+    throw new TypeError('createLiveActivityDispatcher: sender is required');
+  }
+
+  // Serialize observe/sweep/end so two overlapping classify cycles (or a sweep
+  // racing an observe) cannot both start an alert or end one twice.
+  let chain = Promise.resolve();
+  function serialized(task) {
+    const run = chain.then(task, task);
+    chain = run.catch(() => {});
+    return run;
+  }
+
+  async function readActive() {
+    const raw = await redis.command(['GET', KEY_ACTIVE]);
+    if (!raw) return null;
+    try {
+      const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      return parsed && typeof parsed === 'object' && parsed.alertId ? parsed : null;
+    } catch {
+      return null;
+    }
+  }
+
+  async function writeActive(record) {
+    await redis.command(['SET', KEY_ACTIVE, JSON.stringify(record), 'EX', String(LIVE_ACTIVITY_ACTIVE_TTL_S)]);
+  }
+
+  async function listPushToStartTokens() {
+    const cutoff = now() - pushToStartTokenTtlMs;
+    const [, tokens] = await redis.pipeline([
+      ['ZREMRANGEBYSCORE', KEY_PUSH_TO_START, '-inf', String(cutoff)],
+      ['ZRANGE', KEY_PUSH_TO_START, '0', '-1'],
+    ]);
+    return Array.isArray(tokens) ? tokens.filter((t) => typeof t === 'string' && t) : [];
+  }
+
+  async function listUpdateTokens(alertId) {
+    const tokens = await redis.command(['HKEYS', updateTokensKey(alertId)]);
+    return Array.isArray(tokens) ? tokens.filter((t) => typeof t === 'string' && t) : [];
+  }
+
+  async function hasUpdateTokens(alertId) {
+    const count = await redis.command(['HLEN', updateTokensKey(alertId)]);
+    return Number(count) > 0;
+  }
+
+  function contentStateFor(record) {
+    return buildContentState({
+      title: record.title,
+      source: record.source,
+      location: record.location,
+      reports: record.reports,
+      updatedAt: record.updatedAt || record.startedAtMs,
+    }, now());
+  }
+
+  async function fanOut(tokens, kind, sendOne, removeOne) {
+    const outcomes = await mapWithConcurrency(tokens, SEND_CONCURRENCY, async (token) => {
+      let result;
+      try {
+        result = await sendOne(token);
+      } catch (e) {
+        result = { ok: false, reason: e?.message || String(e), removeToken: false };
+      }
+      if (result?.removeToken) {
+        try {
+          await removeOne(token);
+          log.log(`[LiveActivity] removed dead ${kind} token ${maskToken(token)} (${result.reason || result.status})`);
+        } catch (e) {
+          log.warn(`[LiveActivity] failed to remove ${kind} token ${maskToken(token)}: ${e?.message || e}`);
+        }
+      }
+      return result;
+    });
+    const sent = outcomes.filter((r) => r?.ok).length;
+    const dryRun = outcomes.some((r) => r?.dryRun);
+    return { attempted: tokens.length, sent, removed: outcomes.filter((r) => r?.removeToken).length, dryRun };
+  }
+
+  async function endRecord(record, reason) {
+    const alertId = record.alertId;
+    const tokens = await listUpdateTokens(alertId);
+    const dismissalDate = Math.floor(now() / 1000) + END_DISMISSAL_DELAY_S;
+    const contentState = contentStateFor(record);
+    const stats = await fanOut(
+      tokens,
+      'update',
+      (token) => sender.sendEnd(token, contentState, dismissalDate),
+      (token) => redis.command(['HDEL', updateTokensKey(alertId), token]),
+    );
+    // Only clear the active slot if it still points at this alert.
+    const current = await readActive();
+    const commands = [['DEL', updateTokensKey(alertId)]];
+    if (current && current.alertId === alertId) commands.push(['DEL', KEY_ACTIVE]);
+    await redis.pipeline(commands);
+    log.log(`[LiveActivity] ended ${alertId} (${reason}) — end sent to ${stats.sent}/${stats.attempted} update tokens${stats.dryRun ? ' [dry-run]' : ''}`);
+    return { action: 'ended', alertId, reason, ...stats };
+  }
+
+  async function startRecord(record, previous) {
+    const alertId = record.alertId;
+    if (previous) await endRecord(previous, 'superseded');
+    await writeActive(record);
+    const tokens = await listPushToStartTokens();
+    const contentState = contentStateFor(record);
+    const stats = await fanOut(
+      tokens,
+      'push-to-start',
+      (token) => sender.sendStart(token, { alertId, startedAt: record.startedAt, contentState }),
+      (token) => redis.command(['ZREM', KEY_PUSH_TO_START, token]),
+    );
+    log.log(`[LiveActivity] started ${alertId} "${contentState.title.slice(0, 80)}" — push-to-start sent to ${stats.sent}/${stats.attempted} tokens${stats.dryRun ? ' [dry-run]' : ''}`);
+    return { action: 'started', alertId, superseded: previous ? previous.alertId : null, ...stats };
+  }
+
+  async function updateRecord(record) {
+    const alertId = record.alertId;
+    await writeActive(record);
+    const tokens = await listUpdateTokens(alertId);
+    const contentState = contentStateFor(record);
+    const stats = await fanOut(
+      tokens,
+      'update',
+      (token) => sender.sendUpdate(token, contentState),
+      (token) => redis.command(['HDEL', updateTokensKey(alertId), token]),
+    );
+    log.log(`[LiveActivity] updated ${alertId} reports=${record.reports} — update sent to ${stats.sent}/${stats.attempted} tokens${stats.dryRun ? ' [dry-run]' : ''}`);
+    return { action: 'updated', alertId, reports: record.reports, ...stats };
+  }
+
+  /**
+   * @param {{ title: string, link?: string, source?: string, location?: string|null, reports?: number, publishedAt?: number }} alert
+   */
+  function observeCriticalAlert(alert) {
+    return serialized(async () => {
+      const title = String(alert?.title || '').trim();
+      if (!title) return { action: 'skipped', reason: 'empty-title', alertId: '' };
+      const alertId = deriveAlertId(alert.link, title);
+      const t = now();
+      const reports = Math.max(1, Math.floor(Number(alert.reports)) || 1);
+
+      try {
+        const active = await readActive();
+
+        if (active && active.alertId === alertId) {
+          active.lastSeenAt = t;
+          if (reports > (Number(active.reports) || 1)) {
+            active.reports = reports;
+            active.updatedAt = t;
+            return await updateRecord(active);
+          }
+          await writeActive(active);
+          return { action: 'noop', reason: 'no-new-reports', alertId };
+        }
+
+        const publishedAt = Number(alert.publishedAt);
+        if (Number.isFinite(publishedAt) && publishedAt > 0 && t - publishedAt > startWindowMs) {
+          return { action: 'noop', reason: 'outside-start-window', alertId };
+        }
+        if (await hasUpdateTokens(alertId)) {
+          return { action: 'noop', reason: 'activity-already-running', alertId };
+        }
+        const won = await redis.command(['SET', startedKey(alertId), String(t), 'NX', 'EX', String(startedTtlS)]);
+        if (won !== 'OK') return { action: 'noop', reason: 'already-started', alertId };
+
+        const record = {
+          alertId,
+          title,
+          link: String(alert.link || ''),
+          source: String(alert.source || ''),
+          location: typeof alert.location === 'string' && alert.location ? alert.location : null,
+          reports,
+          startedAt: Math.floor(t / 1000),
+          startedAtMs: t,
+          updatedAt: t,
+          lastSeenAt: t,
+        };
+        return await startRecord(record, active);
+      } catch (e) {
+        log.warn(`[LiveActivity] observe error for ${alertId}: ${e?.message || e}`);
+        return { action: 'error', reason: e?.message || String(e), alertId };
+      }
+    });
+  }
+
+  function sweep() {
+    return serialized(async () => {
+      try {
+        const active = await readActive();
+        if (!active) return { action: 'noop', reason: 'no-active-alert' };
+        const t = now();
+        const age = t - (Number(active.startedAtMs) || 0);
+        const idle = t - (Number(active.lastSeenAt) || Number(active.startedAtMs) || 0);
+        if (age >= maxActiveMs) return await endRecord(active, 'max-age');
+        if (idle >= staleMs) return await endRecord(active, 'no-longer-critical');
+        return { action: 'noop', reason: 'active', alertId: active.alertId, ageMs: age };
+      } catch (e) {
+        log.warn(`[LiveActivity] sweep error: ${e?.message || e}`);
+        return { action: 'error', reason: e?.message || String(e) };
+      }
+    });
+  }
+
+  function endActive(reason = 'manual') {
+    return serialized(async () => {
+      try {
+        const active = await readActive();
+        if (!active) return { action: 'noop', reason: 'no-active-alert' };
+        return await endRecord(active, reason);
+      } catch (e) {
+        log.warn(`[LiveActivity] end error: ${e?.message || e}`);
+        return { action: 'error', reason: e?.message || String(e) };
+      }
+    });
+  }
+
+  return { observeCriticalAlert, sweep, endActive, readActive };
+}
+
+module.exports = {
+  KEY_ACTIVE,
+  KEY_PUSH_TO_START,
+  KEY_STARTED_PREFIX,
+  KEY_UPDATE_PREFIX,
+  LIVE_ACTIVITY_MAX_ACTIVE_MS,
+  LIVE_ACTIVITY_STALE_MS,
+  LIVE_ACTIVITY_START_WINDOW_MS,
+  LIVE_ACTIVITY_STARTED_TTL_S,
+  PUSH_TO_START_TOKEN_TTL_MS,
+  createLiveActivityDispatcher,
+  createUpstashCommandClient,
+  startedKey,
+  updateTokensKey,
+};

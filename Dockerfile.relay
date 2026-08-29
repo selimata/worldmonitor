@@ -51,6 +51,12 @@ COPY scripts/lib/llm-model-policy.cjs ./scripts/lib/llm-model-policy.cjs
 COPY scripts/lib/x-news-accounts.cjs ./scripts/lib/x-news-accounts.cjs
 COPY scripts/lib/poll-generation-guard.cjs ./scripts/lib/poll-generation-guard.cjs
 COPY scripts/lib/x-poll-cycle.cjs ./scripts/lib/x-poll-cycle.cjs
+# Live Activity (APNs) sender + dispatcher required at relay startup — critical
+# news alerts become iOS Live Activities (docs/live-activity-push.md). Missing
+# either = ERR_MODULE_NOT_FOUND crash loop. Guarded by
+# tests/dockerfile-relay-imports.test.mjs.
+COPY scripts/lib/apns-live-activity.cjs ./scripts/lib/apns-live-activity.cjs
+COPY scripts/lib/live-activity-dispatch.cjs ./scripts/lib/live-activity-dispatch.cjs
 COPY scripts/shared/country-name-to-iso2.cjs ./scripts/shared/country-name-to-iso2.cjs
 # country-names.json backs the full name→ISO2 map (#5359 uniform country
 # scoping); required by country-name-to-iso2.cjs at startup.

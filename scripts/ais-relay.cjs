@@ -34,6 +34,9 @@ const {
 const xNewsAccounts = require('./lib/x-news-accounts.cjs');
 const { createPollGenerationGuard } = require('./lib/poll-generation-guard.cjs');
 const { createXPollCycle } = require('./lib/x-poll-cycle.cjs');
+// Live Activity (APNs) push for CRITICAL news alerts — docs/live-activity-push.md.
+const { createApnsLiveActivitySender } = require('./lib/apns-live-activity.cjs');
+const { createLiveActivityDispatcher, createUpstashCommandClient } = require('./lib/live-activity-dispatch.cjs');
 const {
   YahooQuoteSummaryClient,
   buildSectorSeedMeta,
@@ -4142,6 +4145,10 @@ async function seedClassifyForVariant(variant, seenTitles) {
     if (!CLASSIFY_VALID_LEVELS.includes(level)) continue;
     if (seenTitles.has(titleArr[i])) continue;
     seenTitles.add(titleArr[i]);
+    // Cached critical hits keep the running Live Activity fed (report-count
+    // growth → update, still-observed → not stale); starts stay restart-safe
+    // via the dispatcher's Redis dedupe + publish-recency window.
+    if (level === 'critical') liveActivityObserve(titleArr[i], allTitles.get(titleArr[i]));
     for (const code of matchCountryNamesInText(titleArr[i])) {
       if (!byCountry[code]) byCountry[code] = emptyLevel();
       byCountry[code][level]++;
@@ -4235,6 +4242,7 @@ async function seedClassifyForVariant(variant, seenTitles) {
           severity: level,
           variant,
         }).catch(e => console.warn('[Notify] Classify publish error:', e?.message));
+        if (level === 'critical') liveActivityObserve(chunk[idx], meta);
       }
     }
 
@@ -4305,6 +4313,83 @@ async function startClassifySeedLoop() {
   const activeProviders = CLASSIFY_LLM_PROVIDERS.filter((p) => !!process.env[p.envKey]).map((p) => p.name);
   console.log(`[Classify] Seed loop starting (interval ${CLASSIFY_SEED_INTERVAL_MS / 1000 / 60}min, providers:${activeProviders.length ? activeProviders.join(',') : 'none'})`);
   startBootSeedLoop('Classify', 'seed-meta:classify', CLASSIFY_SEED_INTERVAL_MS, seedClassify, (e) => console.warn('[Classify] Initial seed error:', e?.message || e), (e) => console.warn('[Classify] Seed error:', e?.message || e));
+}
+
+// ─────────────────────────────────────────────────────────────
+// Live Activity (APNs) hook — CRITICAL news alerts become iOS Live Activities.
+// Detection stays inside seedClassifyForVariant (the LLM critical branch plus
+// cached critical hits); the start/update/end decision and the Redis-backed
+// restart-safe dedupe live in scripts/lib/live-activity-dispatch.cjs, the
+// APNs HTTP/2 transport in scripts/lib/apns-live-activity.cjs. Everything
+// here is wrapped: a failure is logged and never reaches the classify loop.
+// See docs/live-activity-push.md.
+// ─────────────────────────────────────────────────────────────
+const LIVE_ACTIVITY_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
+const LIVE_ACTIVITY_ENABLED = UPSTASH_ENABLED && process.env.LIVE_ACTIVITY_DISABLED !== '1';
+let liveActivityDispatcher = null;
+let liveActivitySender = null;
+if (LIVE_ACTIVITY_ENABLED) {
+  try {
+    liveActivitySender = createApnsLiveActivitySender({ env: process.env, log: console });
+    liveActivityDispatcher = createLiveActivityDispatcher({
+      redis: createUpstashCommandClient({ url: UPSTASH_REDIS_REST_URL, token: UPSTASH_REDIS_REST_TOKEN }),
+      sender: liveActivitySender,
+      log: console,
+    });
+  } catch (e) {
+    liveActivityDispatcher = null;
+    console.warn('[LiveActivity] init failed — hook disabled:', e?.message || e);
+  }
+}
+
+// Display name for the ContentState `location`: the affected country as it is
+// written in the headline. matchCountryNamesInText resolves the ISO2 and the
+// alias table gives the surface form to slice back out of the title.
+function liveActivityLocationForTitle(title) {
+  const [iso2] = matchCountryNamesInText(title);
+  if (!iso2) return null;
+  const lower = title.toLowerCase();
+  for (const entry of THREAT_COUNTRY_NAME_ENTRIES) {
+    if (entry.iso2 !== iso2) continue;
+    const at = lower.indexOf(entry.name);
+    if (at >= 0) return title.slice(at, at + entry.name.length);
+  }
+  return iso2;
+}
+
+function liveActivityObserve(title, meta) {
+  if (!liveActivityDispatcher || !title) return;
+  try {
+    const source = meta?.source ?? '';
+    if (shouldDropRelaySourceForTier(RELAY_GATES_READY, source, RELAY_TIER4_SOURCES)) return;
+    liveActivityDispatcher.observeCriticalAlert({
+      title,
+      link: meta?.link ?? '',
+      source,
+      location: liveActivityLocationForTitle(title),
+      reports: meta?.corroborationCount ?? 1,
+      publishedAt: meta?.publishedAt,
+    }).catch((e) => console.warn('[LiveActivity] observe failed:', e?.message || e));
+  } catch (e) {
+    console.warn('[LiveActivity] observe failed:', e?.message || e);
+  }
+}
+
+// Not a seed loop: no upstream fetch, no seed-meta key — a periodic Redis read
+// that ends the active alert after 4h or once it stops being observed.
+function startLiveActivitySweeper() {
+  if (!liveActivityDispatcher) {
+    console.log(`[LiveActivity] Disabled (${UPSTASH_ENABLED ? 'LIVE_ACTIVITY_DISABLED=1' : 'no Upstash Redis'})`);
+    return;
+  }
+  const apns = liveActivitySender.enabled
+    ? `APNs ${liveActivitySender.config.environment} → ${liveActivitySender.config.topic}`
+    : 'APNs dry-run (set APNS_TEAM_ID / APNS_KEY_ID / APNS_AUTH_KEY to send)';
+  console.log(`[LiveActivity] Enabled — ${apns}; sweep every ${LIVE_ACTIVITY_SWEEP_INTERVAL_MS / 60000}min`);
+  const timer = setInterval(() => {
+    liveActivityDispatcher.sweep().catch((e) => console.warn('[LiveActivity] sweep failed:', e?.message || e));
+  }, LIVE_ACTIVITY_SWEEP_INTERVAL_MS);
+  timer.unref?.();
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -13042,6 +13127,7 @@ server.listen(PORT, () => {
   startChokepointWarmPingLoop();
   startCableHealthWarmPingLoop();
   startClassifySeedLoop();
+  startLiveActivitySweeper();
   startServiceStatusesSeedLoop();
   startTheaterPostureSeedLoop();
 
