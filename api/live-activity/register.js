@@ -1,7 +1,7 @@
 // POST /api/live-activity/register — iOS Live Activity (APNs) push-token
 // registration for the World Monitor app.
 //
-// Body: { "token": "<hex>", "kind": "push-to-start" | "update", "activityId"?: string }
+// Body: { "token": "<hex>", "kind": "push-to-start" | "update", "activityId"?: string, "lang"?: "<iso639-1>" }
 //   - push-to-start tokens go into the sorted set `live-activity:push-to-start:v1`
 //     (score = registration time, pruned after 30 days).
 //   - update tokens go into the hash `live-activity:update:v1:<activityId>`
@@ -29,6 +29,10 @@ export const UPDATE_KEY_PREFIX = 'live-activity:update:v1:';
 export const PUSH_TO_START_TTL_SECONDS = 30 * 24 * 60 * 60;
 export const UPDATE_TOKEN_TTL_SECONDS = 24 * 60 * 60;
 export const REGISTER_KINDS = Object.freeze(['push-to-start', 'update']);
+// token -> ISO 639-1 device language, for both token kinds. The relay HMGETs it
+// with the token list it is already fanning out to, so the alert headline can be
+// translated per language before it is pushed.
+export const LANG_KEY = 'live-activity:lang:v1';
 
 // Per-IP budget, enforced in-handler like api/wm-session.js. A device
 // registers at most a handful of tokens per launch; 30/min is generous.
@@ -41,6 +45,7 @@ const BODY_READ_TIMEOUT_MS = 5_000;
 // 64 hex chars; ActivityKit push-to-start / update tokens are longer (160+).
 const TOKEN_RE = /^[0-9a-f]{32,512}$/;
 const ACTIVITY_ID_RE = /^[A-Za-z0-9_.:-]{1,128}$/;
+const LANG_RE = /^[a-z]{2,3}$/;
 
 /**
  * Validate the register body. Pure — unit-tested directly.
@@ -69,7 +74,11 @@ export function parseRegisterBody(body) {
   if (kind === 'update' && !activityId) {
     return { ok: false, error: 'activityId is required for kind "update"' };
   }
-  return { ok: true, value: { token, kind, activityId } };
+  // Absent or unrecognisable language means English, which is what the wire
+  // already carries — an older client simply keeps today's behaviour.
+  const rawLang = typeof body.lang === 'string' ? body.lang.trim().toLowerCase().split(/[-_]/)[0] : '';
+  const lang = LANG_RE.test(rawLang) ? rawLang : 'en';
+  return { ok: true, value: { token, kind, activityId, lang } };
 }
 
 /**
@@ -78,19 +87,26 @@ export function parseRegisterBody(body) {
  * @param {number} nowMs
  * @returns {string[][]}
  */
-export function buildRegisterCommands({ token, kind, activityId }, nowMs) {
+export function buildRegisterCommands({ token, kind, activityId, lang = 'en' }, nowMs) {
+  // One hash for both kinds; same 30-day horizon as the push-to-start set.
+  const langCommands = [
+    ['HSET', LANG_KEY, token, lang],
+    ['EXPIRE', LANG_KEY, String(PUSH_TO_START_TTL_SECONDS)],
+  ];
   if (kind === 'push-to-start') {
     const cutoff = nowMs - PUSH_TO_START_TTL_SECONDS * 1000;
     return [
       ['ZADD', PUSH_TO_START_KEY, String(nowMs), token],
       ['ZREMRANGEBYSCORE', PUSH_TO_START_KEY, '-inf', String(cutoff)],
       ['EXPIRE', PUSH_TO_START_KEY, String(PUSH_TO_START_TTL_SECONDS)],
+      ...langCommands,
     ];
   }
   const key = `${UPDATE_KEY_PREFIX}${activityId}`;
   return [
     ['HSET', key, token, String(nowMs)],
     ['EXPIRE', key, String(UPDATE_TOKEN_TTL_SECONDS)],
+    ...langCommands,
   ];
 }
 

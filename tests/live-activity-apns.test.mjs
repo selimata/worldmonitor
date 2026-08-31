@@ -140,7 +140,7 @@ describe('payload builders', () => {
         'content-state': CONTENT_STATE,
         'attributes-type': 'WorldAlertAttributes',
         attributes: { alertId: 'abc123', startedAt: 1_800_000_000 },
-        alert: { title: 'World Alert', body: 'Iran closes Strait of Hormuz' },
+        alert: { 'title-loc-key': 'WORLD ALERT', body: 'Iran closes Strait of Hormuz' },
       },
     });
   });
@@ -166,7 +166,7 @@ describe('payload builders', () => {
 
   it('content state normalizes fields, pins level=critical, and uses unix seconds', () => {
     const state = apns.buildContentState({ title: '  Big news  ', source: 'AP', location: '', reports: '4', updatedAt: 1_800_000_000_999 }, 0);
-    assert.deepEqual(state, { title: 'Big news', source: 'AP', location: null, level: 'critical', reports: 4, updatedAt: 1_800_000_000 });
+    assert.deepEqual(state, { title: 'Big news', source: 'AP', location: null, link: null, level: 'critical', reports: 4, updatedAt: 1_800_000_000 });
     const fallback = apns.buildContentState({ title: 'x', reports: 0 }, 1_800_000_000_000);
     assert.equal(fallback.reports, 1);
     assert.equal(fallback.updatedAt, 1_800_000_000);

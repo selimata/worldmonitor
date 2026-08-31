@@ -20,6 +20,7 @@ const {
   buildRegisterCommands,
   PUSH_TO_START_KEY,
   UPDATE_KEY_PREFIX,
+  LANG_KEY,
   PUSH_TO_START_TTL_SECONDS,
   UPDATE_TOKEN_TTL_SECONDS,
 } = await import('../api/live-activity/register.js');
@@ -95,12 +96,14 @@ afterEach(() => {
 
 describe('parseRegisterBody', () => {
   it('accepts push-to-start and update registrations, lowercasing the token', () => {
+    // No lang on the body — an older client — is English, which is the wire language.
     assert.deepEqual(parseRegisterBody({ token: PTS_TOKEN, kind: 'push-to-start' }), {
-      ok: true, value: { token: PTS_TOKEN.toLowerCase(), kind: 'push-to-start', activityId: null },
+      ok: true, value: { token: PTS_TOKEN.toLowerCase(), kind: 'push-to-start', activityId: null, lang: 'en' },
     });
-    assert.deepEqual(parseRegisterBody({ token: UPDATE_TOKEN, kind: 'update', activityId: 'abc123def456' }), {
-      ok: true, value: { token: UPDATE_TOKEN, kind: 'update', activityId: 'abc123def456' },
+    assert.deepEqual(parseRegisterBody({ token: UPDATE_TOKEN, kind: 'update', activityId: 'abc123def456', lang: 'TR' }), {
+      ok: true, value: { token: UPDATE_TOKEN, kind: 'update', activityId: 'abc123def456', lang: 'tr' },
     });
+    assert.equal(parseRegisterBody({ token: PTS_TOKEN, kind: 'push-to-start', lang: 'nonsense' }).value.lang, 'en');
   });
 
   it('rejects malformed bodies with a specific error', () => {
@@ -119,10 +122,12 @@ describe('parseRegisterBody', () => {
 describe('buildRegisterCommands', () => {
   it('push-to-start: ZADD by time, prune older than 30 days, refresh key TTL', () => {
     const now = 1_800_000_000_000;
-    assert.deepEqual(buildRegisterCommands({ token: 'ab', kind: 'push-to-start', activityId: null }, now), [
+    assert.deepEqual(buildRegisterCommands({ token: 'ab', kind: 'push-to-start', activityId: null, lang: 'tr' }, now), [
       ['ZADD', PUSH_TO_START_KEY, String(now), 'ab'],
       ['ZREMRANGEBYSCORE', PUSH_TO_START_KEY, '-inf', String(now - PUSH_TO_START_TTL_SECONDS * 1000)],
       ['EXPIRE', PUSH_TO_START_KEY, String(PUSH_TO_START_TTL_SECONDS)],
+      ['HSET', LANG_KEY, 'ab', 'tr'],
+      ['EXPIRE', LANG_KEY, String(PUSH_TO_START_TTL_SECONDS)],
     ]);
     assert.equal(PUSH_TO_START_KEY, 'live-activity:push-to-start:v1');
     assert.equal(PUSH_TO_START_TTL_SECONDS, 30 * 24 * 60 * 60);
@@ -132,8 +137,11 @@ describe('buildRegisterCommands', () => {
     assert.deepEqual(buildRegisterCommands({ token: 'cd', kind: 'update', activityId: 'alert1' }, 5), [
       ['HSET', `${UPDATE_KEY_PREFIX}alert1`, 'cd', '5'],
       ['EXPIRE', `${UPDATE_KEY_PREFIX}alert1`, String(UPDATE_TOKEN_TTL_SECONDS)],
+      ['HSET', LANG_KEY, 'cd', 'en'],
+      ['EXPIRE', LANG_KEY, String(PUSH_TO_START_TTL_SECONDS)],
     ]);
     assert.equal(UPDATE_KEY_PREFIX, 'live-activity:update:v1:');
+    assert.equal(LANG_KEY, 'live-activity:lang:v1');
   });
 });
 

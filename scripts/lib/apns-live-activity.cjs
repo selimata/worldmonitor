@@ -35,7 +35,11 @@ const APNS_HOSTS = Object.freeze({
 const DEFAULT_BUNDLE_ID = 'com.worldmonitor';
 const ATTRIBUTES_TYPE = 'WorldAlertAttributes';
 const CONTENT_LEVEL = 'critical';
-const START_ALERT_TITLE = 'World Alert';
+// Localized by iOS against the app bundle's compiled strings. The key is the
+// String Catalog's English source string, which carries all 41 translations
+// (WorldView/WorldMonitor/Localizable.xcstrings). A locale missing the entry
+// falls back to the key itself, which is already correct English.
+const START_ALERT_TITLE_LOC_KEY = 'WORLD ALERT';
 // Apple accepts provider tokens for up to 60 minutes; refresh at 50 so a token
 // minted just before the boundary is never presented stale.
 const JWT_TTL_MS = 50 * 60 * 1000;
@@ -126,12 +130,13 @@ function createJwtProvider(config, { now = Date.now, ttlMs = JWT_TTL_MS } = {}) 
   };
 }
 
-function buildContentState({ title, source, location, reports, updatedAt } = {}, nowMs = Date.now()) {
+function buildContentState({ title, source, location, reports, updatedAt, link } = {}, nowMs = Date.now()) {
   const reportCount = Math.floor(Number(reports));
   return {
     title: String(title || '').trim().slice(0, TITLE_MAX_CHARS),
     source: String(source || '').trim(),
     location: typeof location === 'string' && location.trim() ? location.trim() : null,
+    link: typeof link === 'string' && link.trim() ? link.trim() : null,
     level: CONTENT_LEVEL,
     reports: Number.isFinite(reportCount) && reportCount > 0 ? reportCount : 1,
     updatedAt: toUnixSeconds(updatedAt, nowMs),
@@ -146,7 +151,7 @@ function buildStartPayload({ alertId, startedAt, contentState, nowSeconds = Math
       'content-state': contentState,
       'attributes-type': ATTRIBUTES_TYPE,
       attributes: { alertId: String(alertId), startedAt: toUnixSeconds(startedAt, nowSeconds * 1000) },
-      alert: { title: START_ALERT_TITLE, body: contentState.title },
+      alert: { 'title-loc-key': START_ALERT_TITLE_LOC_KEY, body: contentState.title },
     },
   };
 }

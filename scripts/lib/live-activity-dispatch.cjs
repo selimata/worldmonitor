@@ -33,6 +33,10 @@ const KEY_PUSH_TO_START = 'live-activity:push-to-start:v1';
 const KEY_ACTIVE = 'live-activity:active:v1';
 const KEY_UPDATE_PREFIX = 'live-activity:update:v1:';
 const KEY_STARTED_PREFIX = 'live-activity:started:v1:';
+const KEY_LANG = 'live-activity:lang:v1';
+// Mirrors TITLE_MAX_CHARS in apns-live-activity.cjs: a translated headline is
+// subject to the same payload budget as the English one.
+const TRANSLATED_TITLE_MAX_CHARS = 200;
 
 const LIVE_ACTIVITY_MAX_ACTIVE_MS = 4 * 60 * 60 * 1000;
 const LIVE_ACTIVITY_STALE_MS = 60 * 60 * 1000;
@@ -106,6 +110,10 @@ async function mapWithConcurrency(items, limit, fn) {
 function createLiveActivityDispatcher({
   redis,
   sender,
+  // (title, langs) => Promise<Record<lang, translatedTitle>>. Absent (unit
+  // tests, a relay with no LLM provider) means everyone keeps the English
+  // headline, which is exactly what shipped before.
+  translate = null,
   log = console,
   now = Date.now,
   maxActiveMs = LIVE_ACTIVITY_MAX_ACTIVE_MS,
@@ -169,9 +177,63 @@ function createLiveActivityDispatcher({
       title: record.title,
       source: record.source,
       location: record.location,
+      link: record.link,
       reports: record.reports,
       updatedAt: record.updatedAt || record.startedAtMs,
     }, now());
+  }
+
+  const LANG_RE = /^[a-z]{2,3}$/;
+
+  /** token -> ISO 639-1, defaulting to English for anything unregistered. */
+  async function langsForTokens(tokens) {
+    const byToken = new Map();
+    if (tokens.length === 0) return byToken;
+    if (typeof translate !== 'function') {
+      // Nothing can be translated, so the lookup would only cost a round trip.
+      for (const token of tokens) byToken.set(token, 'en');
+      return byToken;
+    }
+    let values = [];
+    try {
+      values = await redis.command(['HMGET', KEY_LANG, ...tokens]);
+    } catch (e) {
+      log.warn(`[LiveActivity] lang lookup failed: ${e?.message || e}`);
+    }
+    tokens.forEach((token, i) => {
+      const v = Array.isArray(values) ? values[i] : null;
+      byToken.set(token, typeof v === 'string' && LANG_RE.test(v) ? v : 'en');
+    });
+    return byToken;
+  }
+
+  /**
+   * One ContentState per token: English on the wire, the headline translated
+   * into each language actually registered. One translate call covers them
+   * all, and any failure falls back to English rather than dropping the push.
+   */
+  async function statesByToken(record, tokens) {
+    const base = contentStateFor(record);
+    const langByToken = await langsForTokens(tokens);
+    const targets = [...new Set(langByToken.values())].filter((l) => l !== 'en');
+    let titles = {};
+    if (targets.length > 0 && typeof translate === 'function') {
+      try {
+        titles = (await translate(base.title, targets)) || {};
+      } catch (e) {
+        log.warn(`[LiveActivity] translate failed: ${e?.message || e}`);
+      }
+    }
+    const byLang = new Map([['en', base]]);
+    for (const lang of targets) {
+      const t = titles[lang];
+      byLang.set(lang, typeof t === 'string' && t.trim()
+        ? { ...base, title: t.trim().slice(0, TRANSLATED_TITLE_MAX_CHARS) }
+        : base);
+    }
+    const out = new Map();
+    for (const [token, lang] of langByToken) out.set(token, byLang.get(lang) || base);
+    return { base, out };
   }
 
   async function fanOut(tokens, kind, sendOne, removeOne) {
@@ -200,13 +262,15 @@ function createLiveActivityDispatcher({
   async function endRecord(record, reason) {
     const alertId = record.alertId;
     const tokens = await listUpdateTokens(alertId);
-    const dismissalDate = Math.floor(now() / 1000) + END_DISMISSAL_DELAY_S;
-    const contentState = contentStateFor(record);
+    // A superseded alert is replaced on screen the same second; only one that
+    // ended on its own is worth leaving up to be read.
+    const dismissalDate = Math.floor(now() / 1000) + (reason === 'superseded' ? 0 : END_DISMISSAL_DELAY_S);
+    const { base, out: stateByToken } = await statesByToken(record, tokens);
     const stats = await fanOut(
       tokens,
       'update',
-      (token) => sender.sendEnd(token, contentState, dismissalDate),
-      (token) => redis.command(['HDEL', updateTokensKey(alertId), token]),
+      (token) => sender.sendEnd(token, stateByToken.get(token) || base, dismissalDate),
+      (token) => redis.pipeline([['HDEL', updateTokensKey(alertId), token], ['HDEL', KEY_LANG, token]]),
     );
     // Only clear the active slot if it still points at this alert.
     const current = await readActive();
@@ -222,14 +286,14 @@ function createLiveActivityDispatcher({
     if (previous) await endRecord(previous, 'superseded');
     await writeActive(record);
     const tokens = await listPushToStartTokens();
-    const contentState = contentStateFor(record);
+    const { base, out: stateByToken } = await statesByToken(record, tokens);
     const stats = await fanOut(
       tokens,
       'push-to-start',
-      (token) => sender.sendStart(token, { alertId, startedAt: record.startedAt, contentState }),
-      (token) => redis.command(['ZREM', KEY_PUSH_TO_START, token]),
+      (token) => sender.sendStart(token, { alertId, startedAt: record.startedAt, contentState: stateByToken.get(token) || base }),
+      (token) => redis.pipeline([['ZREM', KEY_PUSH_TO_START, token], ['HDEL', KEY_LANG, token]]),
     );
-    log.log(`[LiveActivity] started ${alertId} "${contentState.title.slice(0, 80)}" — push-to-start sent to ${stats.sent}/${stats.attempted} tokens${stats.dryRun ? ' [dry-run]' : ''}`);
+    log.log(`[LiveActivity] started ${alertId} "${base.title.slice(0, 80)}" — push-to-start sent to ${stats.sent}/${stats.attempted} tokens${stats.dryRun ? ' [dry-run]' : ''}`);
     return { action: 'started', alertId, superseded: previous ? previous.alertId : null, ...stats };
   }
 
@@ -237,12 +301,12 @@ function createLiveActivityDispatcher({
     const alertId = record.alertId;
     await writeActive(record);
     const tokens = await listUpdateTokens(alertId);
-    const contentState = contentStateFor(record);
+    const { base, out: stateByToken } = await statesByToken(record, tokens);
     const stats = await fanOut(
       tokens,
       'update',
-      (token) => sender.sendUpdate(token, contentState),
-      (token) => redis.command(['HDEL', updateTokensKey(alertId), token]),
+      (token) => sender.sendUpdate(token, stateByToken.get(token) || base),
+      (token) => redis.pipeline([['HDEL', updateTokensKey(alertId), token], ['HDEL', KEY_LANG, token]]),
     );
     log.log(`[LiveActivity] updated ${alertId} reports=${record.reports} — update sent to ${stats.sent}/${stats.attempted} tokens${stats.dryRun ? ' [dry-run]' : ''}`);
     return { action: 'updated', alertId, reports: record.reports, ...stats };
@@ -339,6 +403,7 @@ function createLiveActivityDispatcher({
 
 module.exports = {
   KEY_ACTIVE,
+  KEY_LANG,
   KEY_PUSH_TO_START,
   KEY_STARTED_PREFIX,
   KEY_UPDATE_PREFIX,

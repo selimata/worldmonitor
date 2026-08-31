@@ -142,7 +142,7 @@ describe('observeCriticalAlert — start', () => {
     assert.equal(first.alertId, ALERT_ID);
     assert.equal(first.startedAt, Math.floor(T0 / 1000));
     assert.deepEqual(first.contentState, {
-      title: ALERT.title, source: 'Reuters', location: 'Strait of Hormuz', level: 'critical', reports: 2, updatedAt: Math.floor(T0 / 1000),
+      title: ALERT.title, source: 'Reuters', location: 'Strait of Hormuz', link: ALERT.link, level: 'critical', reports: 2, updatedAt: Math.floor(T0 / 1000),
     });
 
     const active = await dispatcher.readActive();
@@ -258,7 +258,8 @@ describe('observeCriticalAlert — one active alert at a time', () => {
 
     assert.equal(sender.sent[0].kind, 'end');
     assert.equal(sender.sent[0].token, 'ee'.repeat(40));
-    assert.equal(sender.sent[0].dismissalDate, Math.floor(clock.now / 1000) + 30 * 60);
+    // Superseded: dismissed at once, so it does not sit next to its replacement.
+    assert.equal(sender.sent[0].dismissalDate, Math.floor(clock.now / 1000));
     assert.equal(sender.sent[0].contentState.title, ALERT.title);
     assert.deepEqual(sender.sent.slice(1).map((s) => s.kind), ['start', 'start', 'start']);
     assert.equal(sender.sent[1].alertId, nextId);

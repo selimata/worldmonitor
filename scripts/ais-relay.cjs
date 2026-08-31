@@ -4334,6 +4334,7 @@ if (LIVE_ACTIVITY_ENABLED) {
     liveActivityDispatcher = createLiveActivityDispatcher({
       redis: createUpstashCommandClient({ url: UPSTASH_REDIS_REST_URL, token: UPSTASH_REDIS_REST_TOKEN }),
       sender: liveActivitySender,
+      translate: liveActivityTranslate,
       log: console,
     });
   } catch (e) {
@@ -4355,6 +4356,91 @@ function liveActivityLocationForTitle(title) {
     if (at >= 0) return title.slice(at, at + entry.name.length);
   }
   return iso2;
+}
+
+// The alert headline is arbitrary English text, so nothing on the device can
+// localize it — the widget extension has no Translation session. One LLM call
+// per alert covers every language actually registered, and the answer is
+// cached in Redis for 6h so `update` pushes never pay for it twice.
+const LIVE_ACTIVITY_I18N_TTL_S = 6 * 60 * 60;
+const LIVE_ACTIVITY_I18N_TIMEOUT_MS = 12000;
+const LIVE_ACTIVITY_I18N_SYSTEM_PROMPT =
+  'You translate breaking-news headlines. Reply with ONLY a JSON object mapping each requested ISO 639-1 code '
+  + 'to the translated headline, e.g. {"tr":"...","de":"..."}. Keep proper nouns, place names and numbers intact. '
+  + 'Do not add commentary, quotes around the object, or any other key.';
+
+function liveActivityI18nKey(title) {
+  const hash = crypto.createHash('sha256').update(title.toLowerCase()).digest('hex').slice(0, 16);
+  return `live-activity:title-i18n:v1:${hash}`;
+}
+
+function liveActivityTranslateOnce(title, langs, apiUrl, model, headers, extraBody, timeout) {
+  return new Promise((resolve) => {
+    const clean = title.replace(/[\n\r]/g, ' ').slice(0, 200).trim();
+    const bodyStr = JSON.stringify({
+      model,
+      messages: [
+        { role: 'system', content: LIVE_ACTIVITY_I18N_SYSTEM_PROMPT },
+        { role: 'user', content: `Languages: ${langs.join(', ')}\nHeadline: ${clean}` },
+      ],
+      temperature: 0,
+      max_tokens: 80 * langs.length + 60,
+      ...extraBody,
+    });
+    const parsed = new URL(apiUrl);
+    const transport = parsed.protocol === 'http:' ? http : https;
+    const req = transport.request(parsed, {
+      method: 'POST',
+      headers: { ...headers, 'Content-Length': Buffer.byteLength(bodyStr) },
+      timeout,
+    }, (resp) => {
+      if (resp.statusCode < 200 || resp.statusCode >= 300) { resp.resume(); return resolve(null); }
+      let data = '';
+      resp.on('data', (chunk) => { data += chunk; });
+      resp.on('end', () => {
+        try {
+          const raw = JSON.parse(data)?.choices?.[0]?.message?.content?.trim();
+          const match = raw && raw.match(/\{[\s\S]*\}/);
+          resolve(match ? JSON.parse(match[0]) : null);
+        } catch { resolve(null); }
+      });
+    });
+    req.on('error', () => resolve(null));
+    req.on('timeout', () => { req.destroy(); resolve(null); });
+    req.end(bodyStr);
+  });
+}
+
+/** @returns {Promise<Record<string, string>>} lang -> translated headline; missing keys stay English. */
+async function liveActivityTranslate(title, langs) {
+  const key = liveActivityI18nKey(title);
+  let have = {};
+  try {
+    const [cached] = await upstashMGet([key]);
+    if (cached && typeof cached === 'object') have = cached;
+  } catch { /* cache miss is not a failure */ }
+  const missing = langs.filter((l) => typeof have[l] !== 'string' || !have[l]);
+  if (missing.length === 0) return have;
+  for (const provider of CLASSIFY_LLM_PROVIDERS) {
+    const envVal = process.env[provider.envKey];
+    if (!envVal) continue;
+    const apiUrl = provider.apiUrlFn ? provider.apiUrlFn(envVal) : provider.apiUrl;
+    const model = typeof provider.model === 'function' ? provider.model() : provider.model;
+    const got = await liveActivityTranslateOnce(
+      title, missing, apiUrl, model, provider.headers(envVal),
+      provider.extraBody || {}, LIVE_ACTIVITY_I18N_TIMEOUT_MS,
+    );
+    if (got && typeof got === 'object') {
+      const merged = { ...have };
+      for (const lang of missing) {
+        if (typeof got[lang] === 'string' && got[lang].trim()) merged[lang] = got[lang].trim();
+      }
+      await upstashSet(key, merged, LIVE_ACTIVITY_I18N_TTL_S);
+      return merged;
+    }
+  }
+  // Every provider declined: English for everyone, same as before this existed.
+  return have;
 }
 
 function liveActivityObserve(title, meta) {
