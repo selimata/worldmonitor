@@ -6,8 +6,10 @@ import {
   decorateInsightsRun,
   insightsFreshnessPatchArgs,
   publishInsightsPayload,
+  insightsLkgAgeMs,
   resolveInsightsFallbackStatus,
   validateInsightsPayload,
+  INSIGHTS_LKG_DEGRADED_PUBLISH_AFTER_MS,
 } from '../scripts/seed-insights.mjs';
 import {
   INSIGHTS_COMPOSER_THREW,
@@ -554,5 +556,58 @@ test('a rejected synthesized brief keeps a successful legacy fallback degraded',
   assert.equal(
     resolveInsightsFallbackStatus({ synthesisFailureCode: null, legacyStatus: 'ok' }),
     'ok',
+  );
+});
+
+test('a long enough outage lets the legacy fallback publish instead of the card going dark', () => {
+  const args = {
+    synthesisFailureCode: INSIGHTS_SYNTHESIS_FAILURE_CODES.GATE,
+    legacyStatus: 'ok',
+  };
+  // While the preserved snapshot is still servable, the strict rule holds.
+  assert.equal(
+    resolveInsightsFallbackStatus({ ...args, lkgAgeMs: 60_000 }),
+    'degraded',
+  );
+  // Past the ceiling it inverts: readers would see nothing at all, and a
+  // grounded single headline is worth more than an empty World Brief card.
+  assert.equal(
+    resolveInsightsFallbackStatus({ ...args, lkgAgeMs: INSIGHTS_LKG_DEGRADED_PUBLISH_AFTER_MS }),
+    'ok',
+  );
+  // A fallback that earned no status of its own gains nothing from the age.
+  assert.equal(
+    resolveInsightsFallbackStatus({
+      ...args,
+      legacyStatus: 'degraded',
+      lkgAgeMs: INSIGHTS_LKG_DEGRADED_PUBLISH_AFTER_MS + 1,
+    }),
+    'degraded',
+  );
+  // An unmeasurable age must never argue for publishing the thinner brief.
+  assert.equal(resolveInsightsFallbackStatus({ ...args, lkgAgeMs: null }), 'degraded');
+  assert.equal(resolveInsightsFallbackStatus(args), 'degraded');
+});
+
+test('the degraded-publish threshold stays under the iOS staleness ceiling', () => {
+  // WorldView/WorldMonitor/Models/WorldBrief.swift — InsightsSnapshot.maxAge.
+  // Publishing exactly as the card blanks would leave no margin for the next
+  // run to land, so the threshold has to sit below it.
+  assert.ok(INSIGHTS_LKG_DEGRADED_PUBLISH_AFTER_MS < 3 * 60 * 60 * 1000);
+});
+
+test('insightsLkgAgeMs reads the snapshot stamp and refuses to guess', () => {
+  assert.equal(
+    insightsLkgAgeMs({ generatedAt: '2026-09-01T00:00:00.000Z' }, Date.parse('2026-09-01T02:00:00.000Z')),
+    2 * 60 * 60 * 1000,
+  );
+  assert.equal(insightsLkgAgeMs(null), null);
+  assert.equal(insightsLkgAgeMs({}), null);
+  assert.equal(insightsLkgAgeMs({ generatedAt: 'not a date' }), null);
+  // A snapshot stamped in the future is not negative age — clamp, do not
+  // let clock skew read as "older than the ceiling".
+  assert.equal(
+    insightsLkgAgeMs({ generatedAt: '2026-09-01T02:00:00.000Z' }, Date.parse('2026-09-01T00:00:00.000Z')),
+    0,
   );
 });

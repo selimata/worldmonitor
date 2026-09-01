@@ -165,8 +165,50 @@ export function validateInsightsPayload(data) {
   return declareRecords(data) > 0;
 }
 
-export function resolveInsightsFallbackStatus({ synthesisFailureCode, legacyStatus }) {
-  return synthesisFailureCode ? 'degraded' : legacyStatus;
+/**
+ * How stale the last good snapshot may get before a single-headline brief
+ * becomes worth more than preserving it.
+ *
+ * The normal rule is that a synthesis failure must not clear: an L2 headline
+ * is thinner than an L1 synthesis, and letting it publish would advance
+ * `generatedAt` and hide that the real brief is failing. That reasoning holds
+ * only while the preserved snapshot is still servable.
+ *
+ * Past this it inverts. The iOS client refuses any snapshot older than three
+ * hours (`InsightsSnapshot.maxAge`), so a preserved LKG beyond that is not the
+ * better brief — it is no brief, and the World Brief card goes dark. Observed
+ * 2026-09-01: every provider's sample was gate-rejected for four hours
+ * straight, the seeder dutifully preserved a snapshot no reader would accept,
+ * and the card was empty the whole time. A grounded single headline beats an
+ * empty card.
+ *
+ * Set below the client's ceiling so the degraded brief lands while there is
+ * still margin, rather than exactly as the card blanks.
+ */
+export const INSIGHTS_LKG_DEGRADED_PUBLISH_AFTER_MS = 2 * 60 * 60 * 1000;
+
+/**
+ * @param {{ synthesisFailureCode: string|null, legacyStatus: string, lkgAgeMs?: number|null }} args
+ */
+export function resolveInsightsFallbackStatus({ synthesisFailureCode, legacyStatus, lkgAgeMs = null }) {
+  if (!synthesisFailureCode) return legacyStatus;
+  // Long outage: let the fallback keep whatever status it earned — see above.
+  if (typeof lkgAgeMs === 'number' && Number.isFinite(lkgAgeMs)
+      && lkgAgeMs >= INSIGHTS_LKG_DEGRADED_PUBLISH_AFTER_MS) {
+    return legacyStatus;
+  }
+  return 'degraded';
+}
+
+/**
+ * Age of the published snapshot, or null when there is none to measure or its
+ * stamp is unreadable. Null keeps the strict rule: never let an unparseable
+ * timestamp argue for publishing a thinner brief.
+ */
+export function insightsLkgAgeMs(existing, now = Date.now()) {
+  const stamp = Date.parse(existing?.generatedAt ?? '');
+  if (!Number.isFinite(stamp)) return null;
+  return Math.max(0, now - stamp);
 }
 
 /**
@@ -980,6 +1022,10 @@ async function fetchInsights() {
     status = resolveInsightsFallbackStatus({
       synthesisFailureCode,
       legacyStatus: legacy.status,
+      // Read here rather than at the preservation branch below: the decision
+      // this feeds is whether the fallback may keep its own status at all, and
+      // that has to be made before the branch can be reached.
+      lkgAgeMs: insightsLkgAgeMs(await readExistingInsights().catch(() => null)),
     });
   }
 
