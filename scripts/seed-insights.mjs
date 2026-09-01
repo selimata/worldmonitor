@@ -48,8 +48,6 @@ export {
 import { buildLlmCallEvent, emitLlmEvents, flushPendingLlmEvents } from './lib/llm-telemetry.cjs';
 import {
   GROQ_DEFAULT_MODEL,
-  OPENROUTER_FREE_BACKUP_MODEL,
-  OPENROUTER_FREE_PRIMARY_MODEL,
   OPENROUTER_PROVIDER_ROUTING,
 } from './_llm-model-timeouts.mjs';
 // Import from the scripts mirror (`scripts/shared/`) — NOT the repo-root
@@ -362,6 +360,38 @@ async function readExistingInsights() {
 // Provider config — mirrors server/_shared/llm.ts getProviderCredentials()
 // Order: Ollama → paid OpenRouter → two fixed free OpenRouter models → Groq.
 // Each free model stays a separate application-validated attempt.
+// The two mid-chain fallbacks, overridden for this seeder only.
+//
+// The shared policy still names the `:free` Gemma variants, and on 2026-09-01
+// those answered "temporarily rate-limited upstream" on every call for hours.
+// That pool is shared across all OpenRouter users, so no amount of credit on
+// this account reaches it — two of this chain's four providers were simply
+// dead. Every run spent its real attempts on the two that were left, the
+// grounding gate rejected both (a routine outcome the chain is sized to
+// absorb), and news:insights went three hours without a write. Past three
+// hours the iOS client refuses the snapshot outright and the World Brief card
+// goes dark.
+//
+// Overridden here rather than in scripts/lib/llm-model-policy.cjs because that
+// policy also feeds forecasts, regional weekly briefs and the relay's classify
+// loop — none of which are failing — and its model names are pinned by parity
+// tests and published methodology docs in two languages. This seeder is the one
+// on fire; widening the blast radius under time pressure is how the next
+// outage starts.
+//
+// Both were chosen by running the real synthesis prompt through them with
+// OPENROUTER_PROVIDER_ROUTING applied. Two things that looked fine on paper and
+// were not: `qwen/qwen3.7-flash` is Alibaba's and returns 404 "All providers
+// have been ignored" against the routing below, and most models expand "Modi"
+// to "Narendra Modi" — a proper noun the headline never contains, which the
+// grounding gate then rejects. solar-pro4 stayed inside the source vocabulary.
+//
+// A fallback that sometimes fails the gate still beats one that always 429s:
+// the gate is what guarantees quality, so a weaker writer costs a rejected
+// sample, never a bad brief.
+const INSIGHTS_FALLBACK_PRIMARY_MODEL = 'upstage/solar-pro4';
+const INSIGHTS_FALLBACK_BACKUP_MODEL = 'meta-llama/llama-4-maverick';
+
 const LLM_PROVIDERS = [
   {
     name: 'ollama',
@@ -390,7 +420,7 @@ const LLM_PROVIDERS = [
     name: 'openrouter-free',
     envKey: 'OPENROUTER_API_KEY',
     apiUrl: 'https://openrouter.ai/api/v1/chat/completions',
-    model: OPENROUTER_FREE_PRIMARY_MODEL,
+    model: INSIGHTS_FALLBACK_PRIMARY_MODEL,
     headers: (key) => ({ 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json', 'HTTP-Referer': 'https://worldmonitor.app', 'X-Title': 'World Monitor', 'User-Agent': CHROME_UA }),
     extraBody: { reasoning: { enabled: false }, provider: OPENROUTER_PROVIDER_ROUTING },
     timeout: 20_000,
@@ -400,7 +430,7 @@ const LLM_PROVIDERS = [
     name: 'openrouter-free-backup',
     envKey: 'OPENROUTER_API_KEY',
     apiUrl: 'https://openrouter.ai/api/v1/chat/completions',
-    model: OPENROUTER_FREE_BACKUP_MODEL,
+    model: INSIGHTS_FALLBACK_BACKUP_MODEL,
     headers: (key) => ({ 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json', 'HTTP-Referer': 'https://worldmonitor.app', 'X-Title': 'World Monitor', 'User-Agent': CHROME_UA }),
     extraBody: { reasoning: { enabled: false }, provider: OPENROUTER_PROVIDER_ROUTING },
     timeout: 20_000,
