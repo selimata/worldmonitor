@@ -140,7 +140,7 @@ describe('payload builders', () => {
         'content-state': CONTENT_STATE,
         'attributes-type': 'WorldAlertAttributes',
         attributes: { alertId: 'abc123', startedAt: 1_800_000_000 },
-        alert: { 'title-loc-key': 'WORLD ALERT', body: 'Iran closes Strait of Hormuz' },
+        alert: { title: 'World Alert', body: 'Iran closes Strait of Hormuz' },
       },
     });
   });

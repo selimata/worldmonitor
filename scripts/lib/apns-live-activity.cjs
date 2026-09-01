@@ -35,11 +35,21 @@ const APNS_HOSTS = Object.freeze({
 const DEFAULT_BUNDLE_ID = 'com.worldmonitor';
 const ATTRIBUTES_TYPE = 'WorldAlertAttributes';
 const CONTENT_LEVEL = 'critical';
-// Localized by iOS against the app bundle's compiled strings. The key is the
-// String Catalog's English source string, which carries all 41 translations
-// (WorldView/WorldMonitor/Localizable.xcstrings). A locale missing the entry
-// falls back to the key itself, which is already correct English.
-const START_ALERT_TITLE_LOC_KEY = 'WORLD ALERT';
+// A literal, NOT a `title-loc-key`.
+//
+// The loc-key form was tried on 2026-08-31 and silently broke every Live
+// Activity: APNs answered 200, and iOS then dropped the push rather than
+// render it. Verified by sending the same start payload twice to one device,
+// one with `title-loc-key: 'WORLD ALERT'` and one with this literal — only the
+// literal arrived. A 200 from APNs means Apple accepted the request, never
+// that the device rendered it, so nothing in the relay logs showed the break.
+//
+// The activity's own chrome is still localized: the widget renders WORLD ALERT,
+// the level and the report count from the app's String Catalog. Only this
+// banner line is English, and a working English banner beats a localized one
+// that never appears. Localizing it properly means sending a per-language
+// literal, which the lang-grouped fan-out below can already carry.
+const START_ALERT_TITLE = 'World Alert';
 // Apple accepts provider tokens for up to 60 minutes; refresh at 50 so a token
 // minted just before the boundary is never presented stale.
 const JWT_TTL_MS = 50 * 60 * 1000;
@@ -151,7 +161,7 @@ function buildStartPayload({ alertId, startedAt, contentState, nowSeconds = Math
       'content-state': contentState,
       'attributes-type': ATTRIBUTES_TYPE,
       attributes: { alertId: String(alertId), startedAt: toUnixSeconds(startedAt, nowSeconds * 1000) },
-      alert: { 'title-loc-key': START_ALERT_TITLE_LOC_KEY, body: contentState.title },
+      alert: { title: START_ALERT_TITLE, body: contentState.title },
     },
   };
 }
