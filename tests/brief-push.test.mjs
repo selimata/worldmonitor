@@ -431,3 +431,17 @@ describe('ais-relay.cjs wiring', () => {
     assert.match(relaySrc, /\n  startBriefPushSweeper\(\);/);
   });
 });
+
+describe('relay freshness gate reads the seed envelope', () => {
+  const relaySrc = readFileSync(resolve(__dirname, '..', 'scripts', 'ais-relay.cjs'), 'utf-8');
+
+  it('unwraps { _seed, data } before reading generatedAt', () => {
+    const fn = relaySrc.slice(relaySrc.indexOf('async function briefPushTick'));
+    assert.match(
+      fn.slice(0, 1100),
+      /const payload = parsed\?\.data \?\? parsed;/,
+      'news:insights:v1 is stored in the canonical seed envelope; reading the top level yields NaN and silently never pushes',
+    );
+    assert.match(fn.slice(0, 1100), /Date\.parse\(payload\?\.generatedAt/);
+  });
+});

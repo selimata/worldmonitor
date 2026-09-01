@@ -4604,7 +4604,13 @@ async function briefPushTick() {
   try {
     const snapshot = await upstashGet(BRIEF_PUSH_INSIGHTS_KEY);
     const parsed = typeof snapshot === 'string' ? JSON.parse(snapshot) : snapshot;
-    const generatedAt = Date.parse(parsed?.generatedAt ?? '');
+    // Seeds are stored in the canonical envelope `{ _seed, data }` — reading
+    // generatedAt off the top level yields undefined, Date.parse gives NaN and
+    // the tick silently returns every time, which looks exactly like "no brief
+    // published" rather than a bug. Falling back to `parsed` keeps this working
+    // if a producer ever writes the payload bare.
+    const payload = parsed?.data ?? parsed;
+    const generatedAt = Date.parse(payload?.generatedAt ?? '');
     if (!Number.isFinite(generatedAt)) return;
     if (Date.now() - generatedAt > BRIEF_PUSH_MAX_AGE_MS) return;
     await briefPushNotifier.notifyPublished();
