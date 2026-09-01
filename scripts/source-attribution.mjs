@@ -755,6 +755,15 @@ const PROVIDER_OVERRIDES = {
     attribution: 'Excluded from the external-provider count: first-party proxy endpoint.',
     status: 'excluded',
   },
+  // First-party like the worldmonitor.app hosts above, but on a vercel.app
+  // domain, so the `.worldmonitor.app` suffix rule below does not reach it and
+  // it has to be named explicitly.
+  'world-monitor-app.vercel.app': {
+    provider: 'World Monitor landing/push service',
+    license: 'Excluded: World Monitor own service/control plane',
+    attribution: 'Excluded from the external-provider count: first-party push-delivery endpoint.',
+    status: 'excluded',
+  },
   'worldmonitor.app': {
     provider: 'World Monitor web app',
     license: 'Excluded: World Monitor own web application',
@@ -830,8 +839,8 @@ const PROVIDER_OVERRIDES = {
 // a provider-bearing override a separate, explicit lifecycle event instead of
 // something `--write` can silently normalize into the manifest.
 export const PROVIDER_IDENTITY_REVIEW = Object.freeze({
-  sha256: 'a7ab631b0e17d681791f6978832fb0a8c4f8567bfa1c90d9e79a747b5a7dfbfe',
-  reason: 'Keep Toronto Police Service C4S live-dispatch on services.arcgis.com distinct from Toronto Police Service Open Data on data.tps.ca and www.tps.ca, so live CAD is not catalogued as Open Data / geopolitics.',
+  sha256: 'e0a6f7e58615021e78487404598e87fa96d0755c1dd62b897e601342036cbf67',
+  reason: 'Register world-monitor-app.vercel.app as first-party. The broadcast push hook posts to its /api/push/send, and the host is first-party in exactly the sense the worldmonitor.app entries are — but on a vercel.app domain, so the `.worldmonitor.app` suffix rule cannot reach it and it must be named. Excluded, so it adds no external provider. Prior epoch: keep Toronto Police Service C4S live-dispatch on services.arcgis.com distinct from Toronto Police Service Open Data on data.tps.ca and www.tps.ca, so live CAD is not catalogued as Open Data / geopolitics.',
   // A URL cited here is scanned like any other: this file sits inside
   // SOURCE_ROOTS, so citing a host that is not already a registered source
   // invents a provider row for it. The B.C. catalogue URLs above are safe

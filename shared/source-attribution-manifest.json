@@ -9899,6 +9899,20 @@
       ]
     },
     {
+      "host": "world-monitor-app.vercel.app",
+      "provider": "World Monitor landing/push service",
+      "kind": "structured",
+      "observed": true,
+      "license": "Excluded: World Monitor own service/control plane",
+      "attribution": "Excluded from the external-provider count: first-party push-delivery endpoint.",
+      "status": "excluded",
+      "references": [
+        {
+          "path": "scripts/lib/broadcast-push.cjs"
+        }
+      ]
+    },
+    {
       "host": "worldmonitor.app",
       "provider": "World Monitor web app",
       "kind": "feed+structured",
