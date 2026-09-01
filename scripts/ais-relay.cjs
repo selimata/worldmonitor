@@ -39,6 +39,8 @@ const { createApnsLiveActivitySender } = require('./lib/apns-live-activity.cjs')
 const { createLiveActivityDispatcher, createUpstashCommandClient } = require('./lib/live-activity-dispatch.cjs');
 // Broadcast APNs alert to every registered iOS device — docs/broadcast-push.md.
 const { createBroadcastPushDispatcher } = require('./lib/broadcast-push.cjs');
+// AI World Brief slot push — docs/broadcast-push.md.
+const { createBriefPushNotifier } = require('./lib/brief-push.cjs');
 const {
   YahooQuoteSummaryClient,
   buildSectorSeedMeta,
@@ -4547,6 +4549,89 @@ function logBroadcastPushStatus() {
     `${c.baseUrl}; min-gap ${c.minGapS}s; cap ${c.hourlyCap}/h; dedup ${c.dedupTtlS}s; ` +
     `APNs ${c.sandbox ? 'sandbox' : 'production'}${c.i18n ? `; i18n ${c.langs.join(',')}` : ''}`,
   );
+}
+
+// ─────────────────────────────────────────────────────────────
+// AI World Brief push — two notifications a day, at each reader's local 10:00
+// and 19:00. See docs/broadcast-push.md and scripts/lib/brief-push.cjs.
+//
+// The natural home for this is the seed-insights cron's afterPublish hook, and
+// that hook exists. It is wired here TOO because seed-insights is registered in
+// scripts/railway-services.json but is not actually deployed on the Railway
+// account that runs this fleet — a hook in a service that never runs announces
+// nothing. Both paths share one Redis dedup key, so whichever fires first wins
+// and the other is suppressed; running both is safe and means the feature works
+// whether or not the seeder is ever scheduled.
+//
+// The tick is 15 minutes rather than hourly on purpose. The dedup key is
+// per-slot-per-UTC-hour, so the first tick inside an hour claims it and the
+// other three no-op — that absorbs cron drift and a restart landing mid-hour,
+// which an exactly-hourly timer would turn into a skipped slot for a whole
+// band of time zones.
+// ─────────────────────────────────────────────────────────────
+const BRIEF_PUSH_TICK_MS = 15 * 60 * 1000;
+const BRIEF_PUSH_INSIGHTS_KEY = 'news:insights:v1';
+/** Matches the client's own staleness gate: a brief older than this is not news. */
+const BRIEF_PUSH_MAX_AGE_MS = 90 * 60 * 1000;
+
+let briefPushNotifier = null;
+if (UPSTASH_ENABLED && process.env.BRIEF_PUSH_ENABLED === '1') {
+  try {
+    briefPushNotifier = createBriefPushNotifier({
+      env: process.env,
+      redis: {
+        setNx: (key, value, ttl) => upstashSetNx(key, value, ttl),
+        del: (key) => upstashDel(key),
+      },
+      log: console,
+    });
+  } catch (e) {
+    briefPushNotifier = null;
+    console.warn('[BriefPush] init failed — hook disabled:', e?.message || e);
+  }
+}
+
+/**
+ * Announce only a brief that is actually fresh.
+ *
+ * This path is not triggered BY a publish, so unlike the seed-insights hook it
+ * has to establish for itself that there is something new to point at. A stale
+ * snapshot means the seeder is failing, and "here's your morning brief" over a
+ * six-hour-old card is worse than silence.
+ */
+async function briefPushTick() {
+  if (!briefPushNotifier) return;
+  try {
+    const snapshot = await upstashGet(BRIEF_PUSH_INSIGHTS_KEY);
+    const parsed = typeof snapshot === 'string' ? JSON.parse(snapshot) : snapshot;
+    const generatedAt = Date.parse(parsed?.generatedAt ?? '');
+    if (!Number.isFinite(generatedAt)) return;
+    if (Date.now() - generatedAt > BRIEF_PUSH_MAX_AGE_MS) return;
+    await briefPushNotifier.notifyPublished();
+  } catch (e) {
+    console.warn('[BriefPush] tick failed:', e?.message || e);
+  }
+}
+
+function startBriefPushSweeper() {
+  if (!briefPushNotifier) {
+    const why = !UPSTASH_ENABLED ? 'no Upstash Redis' : 'BRIEF_PUSH_ENABLED != 1';
+    console.log(`[BriefPush] Disabled (${why})`);
+    return;
+  }
+  const c = briefPushNotifier.config;
+  if (!c.enabled) {
+    console.log('[BriefPush] Inert — PUSH_ADMIN_SECRET not set');
+    return;
+  }
+  console.log(
+    `[BriefPush] Enabled — ${c.dryRun ? 'DRY-RUN (set BRIEF_PUSH_DRY_RUN=0 to send)' : 'LIVE'}; ` +
+    `local ${c.slotHours.morning}:00 & ${c.slotHours.evening}:00; priority[${c.cohorts.join(',')}]; ` +
+    `tick ${BRIEF_PUSH_TICK_MS / 60000}min`,
+  );
+  briefPushTick().catch(() => {});
+  const timer = setInterval(() => { briefPushTick().catch(() => {}); }, BRIEF_PUSH_TICK_MS);
+  timer.unref?.();
 }
 
 // Not a seed loop: no upstream fetch, no seed-meta key — a periodic Redis read
@@ -13305,6 +13390,7 @@ server.listen(PORT, () => {
   // Not a loop — the broadcast hook is driven by the classify pass. This only
   // prints the arming state so a boot log answers "why did nothing push?".
   logBroadcastPushStatus();
+  startBriefPushSweeper();
   startServiceStatusesSeedLoop();
   startTheaterPostureSeedLoop();
 

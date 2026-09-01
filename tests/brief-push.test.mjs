@@ -400,3 +400,34 @@ describe('wiring', () => {
     assert.match(sendEndpointSrc, /filter\.timezone = \{ \$in: audience\.timezone\.slice\(0, MAX_TIMEZONES\) \}/);
   });
 });
+
+// ── The relay also drives this, because seed-insights is not deployed ─────────
+
+describe('ais-relay.cjs wiring', () => {
+  const relaySrc = readFileSync(resolve(__dirname, '..', 'scripts', 'ais-relay.cjs'), 'utf-8');
+
+  it('constructs the notifier behind the same arming flag', () => {
+    assert.match(relaySrc, /UPSTASH_ENABLED && process\.env\.BRIEF_PUSH_ENABLED === '1'/);
+    assert.match(relaySrc, /createBriefPushNotifier\(\{/);
+  });
+
+  it('ticks more often than hourly, so cron drift cannot skip a slot', () => {
+    assert.match(relaySrc, /BRIEF_PUSH_TICK_MS = 15 \* 60 \* 1000/);
+    assert.match(relaySrc, /setInterval\(\(\) => \{ briefPushTick\(\)/);
+  });
+
+  it('refuses to announce a stale brief', () => {
+    const fn = relaySrc.slice(relaySrc.indexOf('async function briefPushTick'));
+    assert.match(fn.slice(0, 900), /BRIEF_PUSH_MAX_AGE_MS/, 'not triggered by a publish, so it must check freshness itself');
+    assert.match(fn.slice(0, 900), /Date\.now\(\) - generatedAt > BRIEF_PUSH_MAX_AGE_MS\) return;/);
+  });
+
+  it('cannot take down the relay', () => {
+    const fn = relaySrc.slice(relaySrc.indexOf('async function briefPushTick'));
+    assert.match(fn.slice(0, 900), /catch \(e\)/);
+  });
+
+  it('is started at boot', () => {
+    assert.match(relaySrc, /\n  startBriefPushSweeper\(\);/);
+  });
+});
