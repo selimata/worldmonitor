@@ -377,6 +377,25 @@ function digestKeyForLanguage(language) {
   return `news:digest:v1:full:${language}`;
 }
 
+/**
+ * A digest shape the caller can actually read items out of.
+ *
+ * `unwrapEnvelope` hands back the raw value when it cannot parse it, so a key
+ * holding anything but the expected object — a half-written warm, a plain
+ * string, whatever the RPC left behind — arrives here as a STRING. A string is
+ * truthy, so `fetchInsights`'s `if (!digest)` guard did not fire: the run
+ * skipped the last-known-good reuse that exists for exactly this case and threw
+ * `Digest has no items (shape: string)` instead, losing the whole cycle.
+ * Observed 2026-09-01 at 02:41 and 09:00.
+ *
+ * Treat unusable as absent. The caller already knows how to degrade.
+ */
+export function usableDigest(value) {
+  if (Array.isArray(value)) return value.length > 0 ? value : null;
+  if (!value || typeof value !== 'object') return null;
+  return value;
+}
+
 async function readDigestFromRedis(key = DIGEST_KEY) {
   const { url, token } = getRedisCredentials();
   const resp = await fetch(`${url}/get/${encodeURIComponent(key)}`, {
@@ -385,7 +404,15 @@ async function readDigestFromRedis(key = DIGEST_KEY) {
   });
   if (!resp.ok) return null;
   const data = await resp.json();
-  return data.result ? unwrapEnvelope(JSON.parse(data.result)).data : null;
+  if (!data.result) return null;
+  let unwrapped;
+  try {
+    unwrapped = unwrapEnvelope(JSON.parse(data.result)).data;
+  } catch {
+    // A key that is not JSON at all is absent as far as this seeder cares.
+    return null;
+  }
+  return usableDigest(unwrapped);
 }
 
 async function readExistingInsights() {
@@ -795,17 +822,28 @@ async function warmDigestCache(language = 'en') {
   }
 }
 
+// Readback schedule after a cache warm: 3s, then 3s, then 5s. Bounded at ~11s
+// so a genuinely missing digest still fails fast enough for the caller's own
+// retry loop to matter.
+const DIGEST_READBACK_BACKOFF_MS = [3_000, 3_000, 5_000];
+
 async function readOrWarmDigest(language) {
   const key = digestKeyForLanguage(language);
   let digest = await readDigestFromRedis(key);
   if (digest) return digest;
   console.log(`  ${language} digest not in Redis, warming cache via RPC...`);
   await warmDigestCache(language);
-  // Wait for the Edge write to propagate before the readback. This is the
-  // existing full/en warm-cache contract, now reused for the Chinese digest.
-  await new Promise(r => setTimeout(r, 3_000));
-  digest = await readDigestFromRedis(key);
-  return digest;
+  // Poll for the Edge write rather than guessing at it. The old fixed 3s wait
+  // was a guess about propagation, and on 2026-09-01 the warm itself took 20
+  // seconds — the readback then landed on a key the write had not finished
+  // settling, and the run was lost. Same total patience as before in the happy
+  // case, because the first poll fires at 3s and usually succeeds.
+  for (const waitMs of DIGEST_READBACK_BACKOFF_MS) {
+    await new Promise((r) => setTimeout(r, waitMs));
+    digest = await readDigestFromRedis(key);
+    if (digest) return digest;
+  }
+  return null;
 }
 
 async function readChinaNewsDigest() {

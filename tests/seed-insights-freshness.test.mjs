@@ -7,6 +7,7 @@ import {
   insightsFreshnessPatchArgs,
   publishInsightsPayload,
   insightsLkgAgeMs,
+  usableDigest,
   resolveInsightsFallbackStatus,
   validateInsightsPayload,
   INSIGHTS_LKG_DEGRADED_PUBLISH_AFTER_MS,
@@ -610,4 +611,32 @@ test('insightsLkgAgeMs reads the snapshot stamp and refuses to guess', () => {
     insightsLkgAgeMs({ generatedAt: '2026-09-01T02:00:00.000Z' }, Date.parse('2026-09-01T00:00:00.000Z')),
     0,
   );
+});
+
+
+test('an unusable digest shape reads as absent so the caller can fall back to LKG', () => {
+  // unwrapEnvelope returns the raw value when it cannot parse it, so a key
+  // holding anything but the expected object arrives as a string. A string is
+  // truthy, which is what let it past `if (!digest)` and cost a whole run with
+  // "Digest has no items (shape: string)" instead of reusing last-known-good.
+  assert.equal(usableDigest('news:digest:v1:full:en'), null);
+  assert.equal(usableDigest(''), null);
+  assert.equal(usableDigest(null), null);
+  assert.equal(usableDigest(undefined), null);
+  assert.equal(usableDigest(42), null);
+  assert.equal(usableDigest(true), null);
+  // An empty array carries no items either — same answer, so the caller takes
+  // the same LKG path rather than throwing on a zero-length digest.
+  assert.equal(usableDigest([]), null);
+});
+
+test('a real digest still passes through untouched', () => {
+  const categorised = { categories: { politics: { items: [{ title: 'x' }] } }, generatedAt: 'now' };
+  assert.equal(usableDigest(categorised), categorised);
+  const flat = [{ title: 'x' }];
+  assert.equal(usableDigest(flat), flat);
+  // Shape the seeder does not recognise is still an object: let the existing
+  // items/articles/headlines probing decide, not this guard.
+  const odd = { items: [] };
+  assert.equal(usableDigest(odd), odd);
 });
