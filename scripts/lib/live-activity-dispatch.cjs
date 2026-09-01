@@ -34,6 +34,7 @@ const KEY_ACTIVE = 'live-activity:active:v1';
 const KEY_UPDATE_PREFIX = 'live-activity:update:v1:';
 const KEY_STARTED_PREFIX = 'live-activity:started:v1:';
 const KEY_LANG = 'live-activity:lang:v1';
+const KEY_LAST_START = 'live-activity:last-start:v1';
 // Mirrors TITLE_MAX_CHARS in apns-live-activity.cjs: a translated headline is
 // subject to the same payload budget as the English one.
 const TRANSLATED_TITLE_MAX_CHARS = 200;
@@ -41,6 +42,20 @@ const TRANSLATED_TITLE_MAX_CHARS = 200;
 const LIVE_ACTIVITY_MAX_ACTIVE_MS = 4 * 60 * 60 * 1000;
 const LIVE_ACTIVITY_STALE_MS = 60 * 60 * 1000;
 const LIVE_ACTIVITY_START_WINDOW_MS = 60 * 60 * 1000;
+// Minimum spacing between two STARTS. Nothing else in this file limits how
+// often a new activity may be raised, and the identity is the headline hash —
+// so one story carried by four outlets under four wordings is four alerts, and
+// they arrive in the same second. Observed 2026-09-01: 24 starts in 15 hours,
+// three of them inside two seconds, on devices that cannot dismiss any of them
+// (see the `end sent to 0/0 update tokens` lines — a push-started activity only
+// becomes endable if the app happened to be running). They stack until iOS
+// stops accepting new ones, and the reader sees nothing further.
+//
+// A time gate bounds that without needing to decide which headlines are the
+// same story, which is the harder problem and the one that can merge two real
+// events by mistake. A held story is not consumed: no dedupe marker is written
+// for it, so it competes again on the next classify pass.
+const LIVE_ACTIVITY_START_COOLDOWN_MS = 30 * 60 * 1000;
 const LIVE_ACTIVITY_STARTED_TTL_S = 6 * 60 * 60;
 const LIVE_ACTIVITY_ACTIVE_TTL_S = 5 * 60 * 60;
 const PUSH_TO_START_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000;
@@ -119,6 +134,7 @@ function createLiveActivityDispatcher({
   maxActiveMs = LIVE_ACTIVITY_MAX_ACTIVE_MS,
   staleMs = LIVE_ACTIVITY_STALE_MS,
   startWindowMs = LIVE_ACTIVITY_START_WINDOW_MS,
+  startCooldownMs = LIVE_ACTIVITY_START_COOLDOWN_MS,
   startedTtlS = LIVE_ACTIVITY_STARTED_TTL_S,
   pushToStartTokenTtlMs = PUSH_TO_START_TOKEN_TTL_MS,
 } = {}) {
@@ -285,6 +301,13 @@ function createLiveActivityDispatcher({
     const alertId = record.alertId;
     if (previous) await endRecord(previous, 'superseded');
     await writeActive(record);
+    // Stamped before the fan-out, not after: the send can take seconds across
+    // dozens of tokens, and a second alert observed meanwhile must already see
+    // the cooldown. TTL is the window itself — an expired key reads as "no
+    // recent start", which is exactly what it means.
+    await redis.command([
+      'SET', KEY_LAST_START, String(now()), 'PX', String(Math.max(1, startCooldownMs)),
+    ]);
     const tokens = await listPushToStartTokens();
     const { base, out: stateByToken } = await statesByToken(record, tokens);
     const stats = await fanOut(
@@ -344,6 +367,24 @@ function createLiveActivityDispatcher({
         if (await hasUpdateTokens(alertId)) {
           return { action: 'noop', reason: 'activity-already-running', alertId };
         }
+        // Deliberately ahead of the dedupe marker below: a story held here must
+        // not burn its one chance, so nothing is written for it and it is
+        // re-observed on the next pass.
+        if (startCooldownMs > 0) {
+          const lastStart = Number(await redis.command(['GET', KEY_LAST_START])) || 0;
+          const since = t - lastStart;
+          if (lastStart > 0 && since >= 0 && since < startCooldownMs) {
+            // Logged, not silent. Every other noop here is invisible, and a
+            // silent hold is indistinguishable from a dead pipeline — which is
+            // how the loc-key outage went unnoticed for eighteen hours.
+            log.log(
+              `[LiveActivity] holding ${alertId} "${title.slice(0, 60)}" — `
+              + `${Math.ceil((startCooldownMs - since) / 60000)}min left of start cooldown`,
+            );
+            return { action: 'noop', reason: 'start-cooldown', alertId };
+          }
+        }
+
         const won = await redis.command(['SET', startedKey(alertId), String(t), 'NX', 'EX', String(startedTtlS)]);
         if (won !== 'OK') return { action: 'noop', reason: 'already-started', alertId };
 
@@ -404,11 +445,13 @@ function createLiveActivityDispatcher({
 module.exports = {
   KEY_ACTIVE,
   KEY_LANG,
+  KEY_LAST_START,
   KEY_PUSH_TO_START,
   KEY_STARTED_PREFIX,
   KEY_UPDATE_PREFIX,
   LIVE_ACTIVITY_MAX_ACTIVE_MS,
   LIVE_ACTIVITY_STALE_MS,
+  LIVE_ACTIVITY_START_COOLDOWN_MS,
   LIVE_ACTIVITY_START_WINDOW_MS,
   LIVE_ACTIVITY_STARTED_TTL_S,
   PUSH_TO_START_TOKEN_TTL_MS,

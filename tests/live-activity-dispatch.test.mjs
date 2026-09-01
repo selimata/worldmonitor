@@ -191,11 +191,69 @@ describe('observeCriticalAlert — restart-safe dedupe', () => {
 
     // Simulate a restart that lost the active record but kept the dedupe marker.
     redis.store.delete(dispatch.KEY_ACTIVE);
-    const second = harness({ redis, sender: fakeSender() });
-    const result = await second.dispatcher.observeCriticalAlert(ALERT);
+    // Past the start cooldown, so the marker is what refuses this — not the
+    // time gate, which would pass the assertion for the wrong reason.
+    const after = T0 + dispatch.LIVE_ACTIVITY_START_COOLDOWN_MS + 1;
+    const second = harness({ redis, sender: fakeSender(), now: () => after });
+    const result = await second.dispatcher.observeCriticalAlert({ ...ALERT, publishedAt: after - 60_000 });
     assert.equal(result.action, 'noop');
     assert.equal(result.reason, 'already-started');
     assert.equal(second.sender.sent.length, 0);
+  });
+
+  it('a different story raised inside the cooldown is HELD, not started', async () => {
+    const { redis, sender, dispatcher, clock } = harness();
+    redis.seedPushToStart(PTS);
+    assert.equal((await dispatcher.observeCriticalAlert(ALERT)).action, 'started');
+    sender.sent.length = 0;
+
+    clock.now = T0 + 60_000;
+    const other = {
+      ...ALERT, title: 'Coup attempt underway in Lagos',
+      link: 'https://example.com/lagos', publishedAt: clock.now - 60_000,
+    };
+    const held = await dispatcher.observeCriticalAlert(other);
+    assert.equal(held.action, 'noop');
+    assert.equal(held.reason, 'start-cooldown');
+    assert.equal(sender.sent.length, 0, 'nothing may reach APNs while held');
+
+    // A held story must keep its chance: no dedupe marker, so once the
+    // cooldown lapses the same story starts normally.
+    const heldId = deriveAlertId(other.link, other.title);
+    assert.equal(redis.store.get(dispatch.startedKey(heldId)), undefined);
+
+    clock.now = T0 + dispatch.LIVE_ACTIVITY_START_COOLDOWN_MS + 1;
+    const later = await dispatcher.observeCriticalAlert({ ...other, publishedAt: clock.now - 60_000 });
+    assert.equal(later.action, 'started');
+  });
+
+  it('the cooldown never blocks an UPDATE to the running alert', async () => {
+    const { redis, sender, dispatcher, clock } = harness();
+    redis.seedPushToStart(PTS);
+    await dispatcher.observeCriticalAlert(ALERT);
+    redis.seedUpdateTokens(ALERT_ID, ['ee'.repeat(40)]);
+    sender.sent.length = 0;
+
+    clock.now = T0 + 60_000;
+    const grown = await dispatcher.observeCriticalAlert({ ...ALERT, reports: 9 });
+    assert.equal(grown.action, 'updated', 'corroboration growth is not a new start');
+    assert.equal(sender.sent[0].kind, 'update');
+  });
+
+  it('the cooldown is stamped before the fan-out, so a same-second second story is held', async () => {
+    const { redis, sender, dispatcher } = harness();
+    redis.seedPushToStart(PTS);
+    await dispatcher.observeCriticalAlert(ALERT);
+    const stamp = redis.calls.find((c) => c[0] === 'SET' && c[1] === dispatch.KEY_LAST_START);
+    assert.ok(stamp, 'a start must record when it happened');
+    assert.deepEqual(stamp.slice(3), ['PX', String(dispatch.LIVE_ACTIVITY_START_COOLDOWN_MS)]);
+    // 2026-09-01: three starts landed inside two seconds. Same clock value here.
+    sender.sent.length = 0;
+    const sameSecond = await dispatcher.observeCriticalAlert({
+      ...ALERT, title: 'Death toll tops 1,000 after Nepal flooding', link: 'https://example.com/nepal',
+    });
+    assert.equal(sameSecond.reason, 'start-cooldown');
+    assert.equal(sender.sent.length, 0);
   });
 
   it('the dedupe marker is SET NX with the 6h TTL', async () => {
@@ -249,7 +307,8 @@ describe('observeCriticalAlert — one active alert at a time', () => {
     redis.seedUpdateTokens(ALERT_ID, ['ee'.repeat(40)]);
     sender.sent.length = 0;
 
-    clock.now = T0 + 20 * 60 * 1000;
+    // Past the start cooldown — this test is about superseding, not the gate.
+    clock.now = T0 + dispatch.LIVE_ACTIVITY_START_COOLDOWN_MS + 60_000;
     const next = { ...ALERT, title: 'Coup attempt underway in Lagos', link: 'https://example.com/lagos', publishedAt: clock.now - 60_000 };
     const nextId = deriveAlertId(next.link, next.title);
     const result = await dispatcher.observeCriticalAlert(next);
