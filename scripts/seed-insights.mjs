@@ -430,6 +430,10 @@ const LLM_PROVIDERS = [
 // provider's Retry-After (429/503) instead of dropping straight to the next
 // provider, but never sleep/fetch past the remaining call budget.
 const INSIGHTS_LLM_MAX_RETRIES = 2;
+// Near-greedy for the first draw: a world brief should be the same brief given
+// the same corpus. The resample deliberately is not — see the queue loop.
+const INSIGHTS_TEMPERATURE = 0.1;
+const INSIGHTS_RESAMPLE_TEMPERATURE = 0.7;
 const INSIGHTS_LLM_RETRY_BASE_MS = 1_000;
 const INSIGHTS_LLM_RETRY_AFTER_MAX_MS = 10_000;
 const INSIGHTS_LLM_CALL_BUDGET_MS = 60_000;
@@ -506,6 +510,14 @@ async function callLLM(headline, options = {}) {
   const resampled = new Set();
   while (queue.length > 0) {
     const provider = queue.shift();
+    // The resample above is only a retry if the second draw CAN differ. At the
+    // near-greedy temperature the first draw uses, asking the same provider for
+    // the same prompt returns the sample its gate just rejected — so the run
+    // spent a call, a rate-limit slot and the budget to be refused identically,
+    // then demoted anyway. Observed 2026-09-01: seven consecutive cycles
+    // rejected on the same lead, news:insights frozen for three hours. Widen
+    // the temperature for that attempt only; the first draw stays as it was.
+    const isResample = resampled.has(provider.name);
     const envVal = process.env[provider.envKey];
     if (!envVal) continue;
 
@@ -535,7 +547,7 @@ async function callLLM(headline, options = {}) {
               { role: 'user', content: userPrompt },
             ],
             max_tokens: maxTokens,
-            temperature: 0.1,
+            temperature: isResample ? INSIGHTS_RESAMPLE_TEMPERATURE : INSIGHTS_TEMPERATURE,
             ...provider.extraBody,
           }),
           signal: AbortSignal.timeout(Math.max(1, Math.min(provider.timeout, usable))),
