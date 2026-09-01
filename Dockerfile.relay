@@ -57,6 +57,11 @@ COPY scripts/lib/x-poll-cycle.cjs ./scripts/lib/x-poll-cycle.cjs
 # tests/dockerfile-relay-imports.test.mjs.
 COPY scripts/lib/apns-live-activity.cjs ./scripts/lib/apns-live-activity.cjs
 COPY scripts/lib/live-activity-dispatch.cjs ./scripts/lib/live-activity-dispatch.cjs
+# Broadcast + AI World Brief pushes (docs/broadcast-push.md). Required at
+# require() time by ais-relay.cjs whether or not the features are armed, so a
+# missing COPY is a boot crash loop, not a disabled feature.
+COPY scripts/lib/broadcast-push.cjs ./scripts/lib/broadcast-push.cjs
+COPY scripts/lib/brief-push.cjs ./scripts/lib/brief-push.cjs
 COPY scripts/shared/country-name-to-iso2.cjs ./scripts/shared/country-name-to-iso2.cjs
 # country-names.json backs the full name→ISO2 map (#5359 uniform country
 # scoping); required by country-name-to-iso2.cjs at startup.
