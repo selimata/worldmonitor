@@ -40,7 +40,9 @@
  *   BROADCAST_PUSH_BASE_URL    default https://world-monitor-app.vercel.app
  *                              (must match AppConfig.landingBaseURL in the app)
  *   PUSH_ADMIN_SECRET          bearer token for pages/api/push/send.ts
- *   BROADCAST_PUSH_MIN_LEVEL   "critical" (DEFAULT) or "high" or "medium"
+ *   BROADCAST_PUSH_MIN_LEVEL   "high" (DEFAULT, inert) — raise to "critical"
+ *                              only as a temporary volume brake; it overrides
+ *                              the user's own priority choice while set.
  *   BROADCAST_PUSH_DEDUP_TTL_S default 21600 (6h)
  *   BROADCAST_PUSH_MIN_GAP_S   default 900 (15min between any two broadcasts)
  *   BROADCAST_PUSH_HOURLY_CAP  default 4
@@ -186,7 +188,17 @@ function createBroadcastPushDispatcher({ env, redis, translate, fetchImpl, log =
   // Dry-run is the DEFAULT, not the exception. An operator has to take an
   // explicit action to point the first real blast at the install base.
   const dryRun = env.BROADCAST_PUSH_DRY_RUN !== '0';
-  const minLevelRank = LEVEL_RANK[normalizeLevel(env.BROADCAST_PUSH_MIN_LEVEL)] ?? LEVEL_RANK.critical;
+  // Defaults to `high`, which is the LOOSEST level the relay hook actually
+  // emits (both call sites gate on critical|high), so this global floor is
+  // inert by default and AUDIENCE_BY_LEVEL — the user's own Settings choice —
+  // is the only thing that decides who hears about a story.
+  //
+  // It defaulted to `critical` during rollout as a volume brake, and that brake
+  // silently voided the Settings copy: a `high` story was dropped before the
+  // audience table ran, so "All breaking news updates" and "Only critical
+  // events" delivered byte-identical notifications. A throttle belongs in the
+  // min-gap and hourly cap, which drop events without lying about preferences.
+  const minLevelRank = LEVEL_RANK[normalizeLevel(env.BROADCAST_PUSH_MIN_LEVEL)] ?? LEVEL_RANK.high;
   const dedupTtlS = envInt(env, 'BROADCAST_PUSH_DEDUP_TTL_S', DEFAULT_DEDUP_TTL_S, 60);
   const minGapS = envInt(env, 'BROADCAST_PUSH_MIN_GAP_S', DEFAULT_MIN_GAP_S, 0);
   const hourlyCap = envInt(env, 'BROADCAST_PUSH_HOURLY_CAP', DEFAULT_HOURLY_CAP, 1);

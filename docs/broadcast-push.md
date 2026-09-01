@@ -120,7 +120,7 @@ To stop immediately, unset `BROADCAST_PUSH_ENABLED` and redeploy — or set
 | `BROADCAST_PUSH_DRY_RUN` | Railway `ais-relay` | **on** | only the literal `0` sends |
 | `PUSH_ADMIN_SECRET` | Railway **and** Vercel | — | must match on both sides |
 | `BROADCAST_PUSH_BASE_URL` | Railway | `https://world-monitor-app.vercel.app` | must match `AppConfig.landingBaseURL` |
-| `BROADCAST_PUSH_MIN_LEVEL` | Railway | `critical` | `high` roughly triples volume |
+| `BROADCAST_PUSH_MIN_LEVEL` | Railway | `high` (inert) | raise to `critical` only as a temporary brake — it overrides the user's own Settings choice while set |
 | `BROADCAST_PUSH_MIN_GAP_S` | Railway | `900` | |
 | `BROADCAST_PUSH_HOURLY_CAP` | Railway | `4` | |
 | `BROADCAST_PUSH_AUDIENCE_LIMIT` | Railway | `5000` | devices **per page**, not an audience cap |

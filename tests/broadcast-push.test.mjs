@@ -226,16 +226,25 @@ describe('arming', () => {
 // ── Level gate ────────────────────────────────────────────────────────────────
 
 describe('BROADCAST_PUSH_MIN_LEVEL', () => {
-  it('defaults to critical-only', async () => {
+  it('is inert by default, so the user\'s own priority decides', async () => {
+    // The relay hook only ever emits critical|high, so a default of `high`
+    // means this global floor never overrides AUDIENCE_BY_LEVEL.
     const { dispatcher, fetchImpl } = makeDispatcher({ BROADCAST_PUSH_MIN_LEVEL: undefined });
+    assert.equal((await dispatcher.observe({ ...CRITICAL, level: 'high' })).action, 'sent');
+    assert.deepEqual(fetchImpl.calls[0].body.audience.priority, ['medium', 'low'],
+      'a high story reaches everyone EXCEPT the critical-only cohort');
+  });
+
+  it('an unrecognised value falls back to the inert default, not to a brake', async () => {
+    const { dispatcher } = makeDispatcher({ BROADCAST_PUSH_MIN_LEVEL: 'everything' });
+    assert.equal((await dispatcher.observe({ ...CRITICAL, level: 'high' })).action, 'sent');
+  });
+
+  it('can still be raised to critical as a deliberate temporary brake', async () => {
+    const { dispatcher, fetchImpl } = makeDispatcher({ BROADCAST_PUSH_MIN_LEVEL: 'critical' });
     assert.equal((await dispatcher.observe({ ...CRITICAL, level: 'high' })).action, 'skipped');
     assert.equal(fetchImpl.calls.length, 0);
     assert.equal((await dispatcher.observe(CRITICAL)).action, 'sent');
-  });
-
-  it('an unrecognised value falls back to critical-only rather than opening the gate', async () => {
-    const { dispatcher } = makeDispatcher({ BROADCAST_PUSH_MIN_LEVEL: 'everything' });
-    assert.equal((await dispatcher.observe({ ...CRITICAL, level: 'high' })).action, 'skipped');
   });
 
   it('drops empty titles', async () => {
