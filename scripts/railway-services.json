@@ -26,6 +26,7 @@
       "scripts/docs-stats.mjs",
       "scripts/generate-inventory-facts.mjs",
       "scripts/lib/apns-live-activity.cjs",
+      "scripts/lib/broadcast-push.cjs",
       "scripts/lib/llm-model-policy.cjs",
       "scripts/lib/llm-telemetry.cjs",
       "scripts/lib/live-activity-dispatch.cjs",

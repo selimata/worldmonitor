@@ -37,6 +37,8 @@ const { createXPollCycle } = require('./lib/x-poll-cycle.cjs');
 // Live Activity (APNs) push for CRITICAL news alerts — docs/live-activity-push.md.
 const { createApnsLiveActivitySender } = require('./lib/apns-live-activity.cjs');
 const { createLiveActivityDispatcher, createUpstashCommandClient } = require('./lib/live-activity-dispatch.cjs');
+// Broadcast APNs alert to every registered iOS device — docs/broadcast-push.md.
+const { createBroadcastPushDispatcher } = require('./lib/broadcast-push.cjs');
 const {
   YahooQuoteSummaryClient,
   buildSectorSeedMeta,
@@ -4149,6 +4151,12 @@ async function seedClassifyForVariant(variant, seenTitles) {
     // growth → update, still-observed → not stale); starts stay restart-safe
     // via the dispatcher's Redis dedupe + publish-recency window.
     if (level === 'critical') liveActivityObserve(titleArr[i], allTitles.get(titleArr[i]));
+    // Cached hits reach the broadcast hook too: a story first seen as `high`
+    // and re-served from cache must still be able to push once. The
+    // dispatcher's Redis dedup makes the repeat visits free.
+    if (level === 'critical' || level === 'high') {
+      broadcastPushObserve(titleArr[i], allTitles.get(titleArr[i]), level);
+    }
     for (const code of matchCountryNamesInText(titleArr[i])) {
       if (!byCountry[code]) byCountry[code] = emptyLevel();
       byCountry[code][level]++;
@@ -4243,6 +4251,9 @@ async function seedClassifyForVariant(variant, seenTitles) {
           variant,
         }).catch(e => console.warn('[Notify] Classify publish error:', e?.message));
         if (level === 'critical') liveActivityObserve(chunk[idx], meta);
+        // Same gate as the queue publish above, so a broadcast can never reach
+        // a device for a story the PRO relay itself refused to fan out.
+        broadcastPushObserve(chunk[idx], meta, level);
       }
     }
 
@@ -4459,6 +4470,83 @@ function liveActivityObserve(title, meta) {
   } catch (e) {
     console.warn('[LiveActivity] observe failed:', e?.message || e);
   }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Broadcast push hook — a classified headline becomes an APNs alert on every
+// registered iOS device. Distinct from the Live Activity hook above: that one
+// drives ONE persistent lock-screen activity via tokens the relay owns in
+// Redis, this one fans a one-shot banner out to the whole install base via
+// pages/api/push/send.ts, which owns the MongoDB device list.
+//
+// Distinct from publishNotificationEvent() too: that queues a PRO, per-user,
+// rule-matched event onto wm:events:queue for scripts/notification-relay.cjs.
+// This path has no per-user rules — it is the anonymous broadcast every
+// free-tier device opted into through the iOS permission prompt.
+//
+// Disabled unless BROADCAST_PUSH_ENABLED=1, and dry-run unless
+// BROADCAST_PUSH_DRY_RUN=0. See scripts/lib/broadcast-push.cjs.
+// ─────────────────────────────────────────────────────────────
+let broadcastPushDispatcher = null;
+if (UPSTASH_ENABLED && process.env.BROADCAST_PUSH_ENABLED === '1') {
+  try {
+    broadcastPushDispatcher = createBroadcastPushDispatcher({
+      env: process.env,
+      redis: {
+        setNx: (key, value, ttl) => upstashSetNx(key, value, ttl),
+        del: (key) => upstashDel(key),
+      },
+      translate: liveActivityTranslate,
+      log: console,
+    });
+  } catch (e) {
+    broadcastPushDispatcher = null;
+    console.warn('[BroadcastPush] init failed — hook disabled:', e?.message || e);
+  }
+}
+
+/**
+ * Mirrors liveActivityObserve's gating so the two APNs paths can never
+ * disagree about which sources are publishable. The recency check is repeated
+ * here rather than inherited because the cached-classification call site does
+ * not run the RELAY_GATES_READY block, and a stale headline is far worse as a
+ * broadcast banner than as a Live Activity refresh.
+ */
+function broadcastPushObserve(title, meta, level) {
+  if (!broadcastPushDispatcher || !title) return;
+  try {
+    const source = meta?.source ?? '';
+    if (shouldDropRelaySourceForTier(RELAY_GATES_READY, source, RELAY_TIER4_SOURCES)) return;
+    const publishedAt = meta?.publishedAt;
+    if (publishedAt && Date.now() - publishedAt > RELAY_RECENCY_MS) return;
+    broadcastPushDispatcher.observe({
+      title,
+      level,
+      link: meta?.link ?? '',
+      source,
+      publishedAt,
+    }).catch((e) => console.warn('[BroadcastPush] observe failed:', e?.message || e));
+  } catch (e) {
+    console.warn('[BroadcastPush] observe failed:', e?.message || e);
+  }
+}
+
+function logBroadcastPushStatus() {
+  if (!broadcastPushDispatcher) {
+    const why = !UPSTASH_ENABLED ? 'no Upstash Redis' : 'BROADCAST_PUSH_ENABLED != 1';
+    console.log(`[BroadcastPush] Disabled (${why})`);
+    return;
+  }
+  const c = broadcastPushDispatcher.config;
+  if (!c.enabled) {
+    console.log('[BroadcastPush] Inert — PUSH_ADMIN_SECRET not set');
+    return;
+  }
+  console.log(
+    `[BroadcastPush] Enabled — ${c.dryRun ? 'DRY-RUN (set BROADCAST_PUSH_DRY_RUN=0 to send)' : 'LIVE'}; ` +
+    `${c.baseUrl}; min-gap ${c.minGapS}s; cap ${c.hourlyCap}/h; dedup ${c.dedupTtlS}s; ` +
+    `APNs ${c.sandbox ? 'sandbox' : 'production'}${c.i18n ? `; i18n ${c.langs.join(',')}` : ''}`,
+  );
 }
 
 // Not a seed loop: no upstream fetch, no seed-meta key — a periodic Redis read
@@ -13214,6 +13302,9 @@ server.listen(PORT, () => {
   startCableHealthWarmPingLoop();
   startClassifySeedLoop();
   startLiveActivitySweeper();
+  // Not a loop — the broadcast hook is driven by the classify pass. This only
+  // prints the arming state so a boot log answers "why did nothing push?".
+  logBroadcastPushStatus();
   startServiceStatusesSeedLoop();
   startTheaterPostureSeedLoop();
 
