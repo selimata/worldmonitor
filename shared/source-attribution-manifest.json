@@ -9908,6 +9908,9 @@
       "status": "excluded",
       "references": [
         {
+          "path": "scripts/lib/brief-push.cjs"
+        },
+        {
           "path": "scripts/lib/broadcast-push.cjs"
         }
       ]

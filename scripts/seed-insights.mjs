@@ -11,8 +11,11 @@ import {
   extendExistingTtl,
   isLlmBudgetError,
   readExistingSeedMeta,
+  redisCommand,
   writeExtraKey,
 } from './_seed-utils.mjs';
+// AI World Brief "it's ready" push — see scripts/lib/brief-push.cjs.
+import briefPush from './lib/brief-push.cjs';
 import {
   clusterItems,
   computeEntityCorroboration,
@@ -1239,6 +1242,48 @@ async function finalizeInsightsRun(data, outcome, { previousMeta } = {}) {
   };
 }
 
+/**
+ * Tell iOS devices a fresh AI World Brief is up.
+ *
+ * Swallows everything: this cron's job is to publish a brief, and a push
+ * failure must never turn a good brief into a failed run. The notifier itself
+ * is disarmed unless BRIEF_PUSH_ENABLED=1 and dry-run unless
+ * BRIEF_PUSH_DRY_RUN=0, so importing it costs nothing until it is configured.
+ * See scripts/lib/brief-push.cjs.
+ */
+export async function announceBriefPublished(data) {
+  try {
+    if (process.env.BRIEF_PUSH_ENABLED !== '1') return { action: 'disabled' };
+    const creds = getRedisCredentials();
+    if (!creds) return { action: 'disabled', reason: 'no Redis' };
+    const { url, token } = creds;
+    const notifier = briefPush.createBriefPushNotifier({
+      env: process.env,
+      redis: {
+        // Upstash answers "OK" for a fresh key and null for an existing one;
+        // anything else (a thrown fetch, an error body) is reported as 'error'
+        // so the notifier's fail-closed guard suppresses rather than sends.
+        setNx: async (key, value, ttl) => {
+          try {
+            const res = await redisCommand(url, token, ['SET', key, value, 'NX', 'EX', String(ttl)]);
+            if (res === 'OK') return 'new';
+            if (res === null) return 'duplicate';
+            return 'error';
+          } catch {
+            return 'error';
+          }
+        },
+        del: (key) => redisCommand(url, token, ['DEL', key]),
+      },
+      log: console,
+    });
+    return await notifier.notifyPublished({ generatedAt: data?.generatedAt });
+  } catch (err) {
+    console.warn('  [BriefPush] skipped:', err?.message || err);
+    return { action: 'error', reason: err?.message || String(err) };
+  }
+}
+
 export { callLLM, __setInsightsLlmTransportForTests };
 
 if (_isDirectRun) {
@@ -1257,12 +1302,17 @@ if (_isDirectRun) {
     publishTransform: publishInsightsPayload,
     afterPublish: async (data) => {
       const runMeta = insightsRunMeta(data);
-      return finalizeInsightsRun(
-        data,
-        runMeta?.outcome === INSIGHTS_RUN_OUTCOMES.PUBLISHED
-          ? INSIGHTS_RUN_OUTCOMES.PUBLISHED
-          : INSIGHTS_RUN_OUTCOMES.DEGRADED,
-      );
+      const outcome = runMeta?.outcome === INSIGHTS_RUN_OUTCOMES.PUBLISHED
+        ? INSIGHTS_RUN_OUTCOMES.PUBLISHED
+        : INSIGHTS_RUN_OUTCOMES.DEGRADED;
+      // Only a real publish is worth announcing. A DEGRADED run means the
+      // synthesis failed and the card is thinner than usual, and an
+      // LKG_PRESERVED run never reaches here at all — telling users a brief
+      // refreshed when it did not is worse than staying silent.
+      if (outcome === INSIGHTS_RUN_OUTCOMES.PUBLISHED) {
+        await announceBriefPublished(data);
+      }
+      return finalizeInsightsRun(data, outcome);
     },
     afterValidationSkip: async (data, context) => {
       return finalizeInsightsRun(data, INSIGHTS_RUN_OUTCOMES.LKG_PRESERVED, {
