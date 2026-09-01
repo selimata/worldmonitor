@@ -327,6 +327,16 @@ export function parseWhyMattersV2(text, provenance) {
 // the explicit stop list because they LOOK like proper nouns.
 const TITLE_PREFIX_STOP = new Set([
   'President', 'Prime', 'Minister', 'Senator', 'Representative',
+  // 'PM' sits here for the same reason 'Prime'/'Minister' do: it is an
+  // office, not an identity. Consumed only at sequence START, so a source
+  // headline that opens "Prime Minister Modi ..." and a lead that writes
+  // "PM Modi ..." both reduce to ['modi'] and match, while "India's PM"
+  // keeps ['india','pm'] and still fails against a source that never named
+  // India. Deliberately NOT paired with consuming titles mid-sequence:
+  // that was measured and it lets an invented office ride a real name
+  // ("Indian President Modi" against "Indian Prime Minister Modi"), which
+  // is the May 19 class. See tests/brief-llm-core-office-title.test.mjs.
+  'PM',
   'Dr', 'Dr.', 'Mr', 'Mr.', 'Ms', 'Ms.', 'Mrs', 'Mrs.',
   'Acting', 'Interim', 'Former', 'Ex',
   'Chairman', 'Chairwoman', 'Chair', 'Speaker',
@@ -373,6 +383,16 @@ const ACRONYM_EXPANSIONS = [
   ['DOD', 'Department of Defense', 'Defense Department', 'Pentagon'],
   ['DR Congo', 'Democratic Republic of Congo', 'DRC'],
   ['UAE', 'United Arab Emirates'],
+  // Head-of-government TITLE, not a name. Aug 31: CNBC re-worded one
+  // headline in place ("Indian PM Modi implores..." -> "Indian Prime
+  // Minister Modi asks...") and every synthesis run was then rejected
+  // LEAD_PROPER_NOUN "india pm" for ~4.5h, because a lead rejection drops
+  // the whole brief while a line rejection only degrades that line.
+  // Safe by construction: the equivalence licenses the office token and
+  // nothing else, so the May 19 class -- an invented NAME ("Michel Aoun")
+  // against a headline that names nobody -- is untouched. Pinned in
+  // tests/brief-llm-core-office-title.test.mjs.
+  ['PM', 'Prime Minister'],
 ];
 
 // Demonym ↔ nation table. "Israeli strikes" headline ↔ "Israel struck"
