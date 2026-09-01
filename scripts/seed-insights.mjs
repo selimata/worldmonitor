@@ -1277,7 +1277,9 @@ export async function announceBriefPublished(data) {
       },
       log: console,
     });
-    return await notifier.notifyPublished({ generatedAt: data?.generatedAt });
+    // Takes no argument: which devices hear about this publish is decided by
+    // which IANA zones have just rolled into a slot hour, not by the brief.
+    return await notifier.notifyPublished();
   } catch (err) {
     console.warn('  [BriefPush] skipped:', err?.message || err);
     return { action: 'error', reason: err?.message || String(err) };

@@ -227,31 +227,61 @@ node --test tests/broadcast-push.test.mjs
 
 # AI World Brief push
 
-A second, separate notification: "your digest refreshed", not "something
-happened". Lives in `scripts/lib/brief-push.cjs`, fires from the
-`seed-insights` Railway cron's `afterPublish` hook.
+Two notifications a day, in the reader's own morning and evening. Lives in
+`scripts/lib/brief-push.cjs`, fires from the `seed-insights` Railway cron's
+`afterPublish` hook.
 
-**Cadence is the whole design problem.** That cron runs **hourly** (the client
-treats a brief older than 60 min as stale), so pushing on every refresh would be
-~24 notifications a day. `BRIEF_PUSH_MIN_GAP_S` defaults to **86400** — once a
-day. The cron's rhythm is deliberately not the notification rhythm.
+| Slot | Local hour | Emoji | Framing |
+|---|---|---|---|
+| morning | 10:00 | 🌅 | what happened overnight |
+| evening | 19:00 | 🌆 | where the world stands as the day closes |
 
-**Audience is `low` only.** A brief has no severity — it is a schedule, not an
-event — so it goes solely to the cohort whose Settings wording ("All breaking
-news updates") admits a digest. `medium` and `high` both promise severity
-filtering a brief cannot satisfy, and `includeUnsetPriority` is hard-coded
-false because unset means the iOS default `medium`.
+## Local time without offset maths
 
-**Copy ships translated**, not LLM-generated: the title is lifted verbatim from
-the app's own `AI World Brief` String Catalog entry (so the banner names the
-feature exactly as the screen it opens does), prefixed with 🌍; the body is a
-fixed sentence per language. Keyed by base language code — the device sends
-`languageCode` only, so "pt" and "zh", never "pt-BR" or "zh-Hans". A test
-asserts every base language the app ships has copy.
+Devices already store their IANA zone (`timezone: "Europe/Istanbul"`, written by
+`NotificationService.registerDeviceWithBackend`). So the cron never computes an
+offset: on each hourly run it asks which zones are AT the slot hour right now
+and hands that list to the send endpoint as `audience.timezone`. Mongo does the
+rest with a `$in`.
 
-Route is `{type:"brief"}` → PushRoute.brief → World Report with the brief open.
-`collapseId: "brief"` replaces an older unread banner rather than stacking.
-APNs priority 5, not 10: a digest should not wake the device.
+The hourly cron is what makes this work — every tick catches the next band of
+zones rolling into 10:00 or 19:00. Roughly 2 of 24 ticks reach any given zone;
+the rest are cheap no-ops.
+
+**The slot matches on the HOUR, not hour+minute.** A UTC-aligned cron never
+observes Asia/Kolkata (+5:30) or Asia/Kathmandu (+5:45) at exactly 10:00 — they
+are at 10:30 and 10:45. Matching the hour is what includes them instead of
+silently skipping every half-hour-offset country on earth. A test asserts the
+24 hour-buckets *partition* the full 418-zone IANA table: no zone in two
+buckets (two pushes a day) and none in zero (a silently skipped region).
+
+Dedup is keyed per slot per UTC tick, not per day: each tick serves a different
+band of zones, so a global daily key would let the first band through and starve
+the other 23.
+
+## Audience is `low` only
+
+A brief has no severity — it is a schedule, not an event — so it goes solely to
+the cohort whose Settings wording ("All breaking news updates") admits a digest.
+`medium` and `high` both promise severity filtering a brief cannot satisfy, and
+`includeUnsetPriority` is hard-coded false because unset means the iOS default
+`medium`. Widening `BRIEF_PUSH_COHORTS` means changing what Settings promises.
+
+## Copy
+
+Ships translated, not LLM-generated. The title is the app's own `AI World Brief`
+String Catalog entry verbatim — so the banner names the feature exactly as the
+screen it opens does — prefixed with the slot emoji, which is also what tells
+the two slots apart at a glance. Bodies are one fixed sentence per slot per
+language.
+
+Keyed by base language code: the device sends `languageCode` only, so "pt" and
+"zh", never "pt-BR" or "zh-Hans". A test asserts every base language the app
+ships has copy, and that the titles have not drifted from the String Catalog.
+
+Route `{type:"brief"}` → PushRoute.brief → World Report with the brief open.
+`collapseId: "brief-<slot>"` so an evening banner replaces an unread morning
+one. APNs priority 5, not 10: a digest should not wake the device.
 
 Fires only on outcome `PUBLISHED`. A `DEGRADED` run means synthesis failed, and
 announcing a refresh that did not happen is worse than silence.
@@ -261,7 +291,8 @@ announcing a refresh that did not happen is worse than silence.
 | `BRIEF_PUSH_ENABLED` | Railway `seed-insights` | off | `1` to arm |
 | `BRIEF_PUSH_DRY_RUN` | Railway `seed-insights` | **on** | only the literal `0` sends |
 | `PUSH_ADMIN_SECRET` | Railway `seed-insights` | — | same value as Vercel |
-| `BRIEF_PUSH_MIN_GAP_S` | Railway | `86400` | lower with care — the cron is hourly |
+| `BRIEF_PUSH_MORNING_HOUR` | Railway | `10` | local hour, clamped 0-23 |
+| `BRIEF_PUSH_EVENING_HOUR` | Railway | `19` | local hour, clamped 0-23 |
 | `BRIEF_PUSH_COHORTS` | Railway | `low` | widening changes what Settings promises |
 | `BRIEF_PUSH_PAGE_SIZE` | Railway | `5000` | |
 | `BRIEF_PUSH_MAX_PAGES` | Railway | `20` | |

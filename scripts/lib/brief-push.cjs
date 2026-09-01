@@ -1,33 +1,48 @@
 'use strict';
 
 /**
- * AI World Brief push — tells users a freshly published brief is ready.
+ * AI World Brief push — two notifications a day, in the reader's own morning
+ * and evening.
  *
  * WHY THIS IS NOT scripts/lib/broadcast-push.cjs
  * ----------------------------------------------
- * That module answers "something happened in the world"; this one answers "your
- * digest refreshed". They differ on every axis that matters:
+ * That module answers "something happened in the world"; this one answers
+ * "here is your twice-daily read". They differ on every axis that matters:
  *
  *   - Audience. Broadcast maps an event's severity onto the threshold the user
- *     picked in Settings. A brief has no severity — it is a schedule, not an
- *     event — so it goes ONLY to the `low` cohort ("All breaking news
- *     updates"). Sending it to someone who asked for "only critical events —
- *     direct military strikes, major attacks" would break the promise that
- *     setting makes, no matter how interesting the brief is.
- *   - Copy. A broadcast body is a headline that only exists at send time.
- *     A brief body is fixed, so it ships fully translated (TITLE_BY_LANG /
- *     BODY_BY_LANG below) instead of paying an LLM per send.
- *   - Cadence. The brief cron runs HOURLY (Dockerfile.seed-insights: the client
- *     treats a snapshot older than 60 min as stale). Pushing every refresh
- *     would be ~24 notifications a day, so MIN_GAP defaults to 24h and the
- *     cron's own rhythm is deliberately NOT the notification rhythm.
+ *     picked in Settings. A brief has no severity — it is a schedule — so it
+ *     goes ONLY to the `low` cohort ("All breaking news updates"). Sending it
+ *     to someone who asked for "only critical events — direct military strikes,
+ *     major attacks" would break the promise that setting makes.
+ *   - Copy. A broadcast body is a headline that exists only at send time.
+ *     These bodies are fixed, so they ship fully translated instead of paying
+ *     an LLM per send.
+ *   - Timing. Broadcast fires the moment news breaks. This fires at a LOCAL
+ *     wall-clock hour, so the same notification reaches Istanbul and São Paulo
+ *     at each reader's 10:00, not simultaneously.
  *   - APNs priority 5, not 10. A digest is not time-critical; 5 lets iOS batch
  *     the delivery for battery.
+ *
+ * HOW LOCAL TIME WORKS WITHOUT ANY OFFSET MATHS
+ * ---------------------------------------------
+ * Devices already store their IANA zone (`timezone: "Europe/Istanbul"`, written
+ * by NotificationService.registerDeviceWithBackend). So the cron does not
+ * compute offsets: on each hourly run it asks which zones are AT the slot hour
+ * right now, and hands that list to the send endpoint as `audience.timezone`.
+ * Mongo does the rest with a `$in`.
+ *
+ * This is why the slot is matched on the HOUR and not on hour+minute. Zones at
+ * :30 and :45 offsets (Asia/Kolkata, Asia/Kathmandu, Australia/Eucla) are never
+ * at exactly 10:00 when a UTC-aligned cron fires — they are at 10:30 or 10:45,
+ * and matching the hour is what includes them instead of silently skipping
+ * every half-hour-offset country on earth.
  *
  * WHERE IT RUNS
  * -------------
  * Inside the `seed-insights` Railway cron, hooked to runSeed's `afterPublish`
- * and fired only for outcome PUBLISHED. A degraded or last-known-good-preserved
+ * and fired only for outcome PUBLISHED. That cron runs HOURLY, which is exactly
+ * what makes local-hour targeting work: every hour it catches the next band of
+ * zones rolling into 10:00 or 19:00. A degraded or last-known-good-preserved
  * run means the brief did NOT refresh, and announcing one that did not happen
  * is worse than staying silent.
  *
@@ -36,7 +51,8 @@
  *   BRIEF_PUSH_DRY_RUN    "1" (DEFAULT) matches the audience without sending.
  *   BRIEF_PUSH_BASE_URL   default https://world-monitor-app.vercel.app
  *   PUSH_ADMIN_SECRET     bearer for pages/api/push/send.ts
- *   BRIEF_PUSH_MIN_GAP_S  default 86400 (once a day)
+ *   BRIEF_PUSH_MORNING_HOUR  local hour for the overnight recap, default 10
+ *   BRIEF_PUSH_EVENING_HOUR  local hour for the day's close, default 19
  *   BRIEF_PUSH_COHORTS    comma list, default "low"
  *   BRIEF_PUSH_PAGE_SIZE  devices per request, default 5000
  *   BRIEF_PUSH_MAX_PAGES  runaway guard, default 20
@@ -49,12 +65,18 @@
 const REQUEST_TIMEOUT_MS = 30_000;
 const DEFAULT_BASE_URL = 'https://world-monitor-app.vercel.app';
 const SEND_PATH = '/api/push/send';
-const KEY_PREFIX = 'wm:brief-push:v1';
+const KEY_PREFIX = 'wm:brief-push:v2';
 
-/** The brief cron is hourly; this is what stops that becoming 24 pushes a day. */
-const DEFAULT_MIN_GAP_S = 24 * 60 * 60;
+const DEFAULT_MORNING_HOUR = 10;
+const DEFAULT_EVENING_HOUR = 19;
 const DEFAULT_PAGE_SIZE = 5_000;
 const DEFAULT_MAX_PAGES = 20;
+/**
+ * A slot fires once per zone per day, so the dedup key only has to survive one
+ * hourly tick. 6h gives a stalled or retried cron plenty of room without ever
+ * reaching the next day's slot.
+ */
+const SLOT_DEDUP_TTL_S = 6 * 60 * 60;
 /**
  * `low` = "All breaking news updates" — the only tier whose wording admits a
  * scheduled digest. `medium` and `high` both promise event severity filtering,
@@ -109,48 +131,90 @@ const TITLE_BY_LANG = Object.freeze({
   zh: 'AI 全球简报',
 });
 
-/** "It's ready — go look at what the world is doing." */
-const BODY_BY_LANG = Object.freeze({
-  ar: 'موجز جديد جاهز — اطّلع على ما يجري في العالم الآن.',
-  ca: 'Nou resum a punt: mira què passa al món ara mateix.',
-  cs: 'Nový souhrn je tu — podívejte se, co se právě děje ve světě.',
-  da: 'Ny briefing er klar – se hvad der sker i verden lige nu.',
-  de: 'Neues Briefing ist da – sieh, was gerade in der Welt passiert.',
-  el: 'Νέα ενημέρωση — δες τι συμβαίνει τώρα στον κόσμο.',
-  en: "Fresh brief is live — see what's happening in the world right now.",
-  es: 'Nuevo resumen listo: mira qué está pasando en el mundo ahora.',
-  fi: 'Uusi katsaus on valmis – katso, mitä maailmassa tapahtuu juuri nyt.',
-  fr: 'Nouveau bilan disponible — voyez ce qui se passe dans le monde.',
-  he: 'תדריך חדש מוכן — ראו מה קורה בעולם עכשיו.',
-  hi: 'नया ब्रीफ़ तैयार — देखें दुनिया में अभी क्या हो रहा है।',
-  hr: 'Novi sažetak je spreman — pogledajte što se događa u svijetu.',
-  hu: 'Elkészült az új összefoglaló – nézd meg, mi történik a világban.',
-  id: 'Ringkasan baru siap — lihat apa yang terjadi di dunia sekarang.',
-  it: 'Nuovo bollettino pronto: guarda cosa sta succedendo nel mondo.',
-  ja: '最新ブリーフが公開。今、世界で何が起きているか確認しましょう。',
-  ko: '새 브리프가 준비됐어요 — 지금 세계에서 무슨 일이 일어나는지 확인하세요.',
-  ms: 'Ringkasan baharu sedia — lihat apa yang berlaku di dunia sekarang.',
-  nb: 'Ny briefing er klar – se hva som skjer i verden nå.',
-  nl: 'Nieuwe briefing staat klaar – zie wat er nu in de wereld gebeurt.',
-  pl: 'Nowy raport gotowy — zobacz, co dzieje się teraz na świecie.',
-  pt: 'Novo resumo disponível — veja o que está acontecendo no mundo agora.',
-  ro: 'Noul rezumat este gata — vezi ce se întâmplă acum în lume.',
-  ru: 'Новая сводка готова — посмотрите, что происходит в мире.',
-  sk: 'Nový prehľad je pripravený — pozrite, čo sa deje vo svete.',
-  sl: 'Novi pregled je pripravljen — poglejte, kaj se dogaja po svetu.',
-  sv: 'Ny briefing är klar – se vad som händer i världen just nu.',
-  th: 'สรุปใหม่พร้อมแล้ว — ดูว่าตอนนี้เกิดอะไรขึ้นในโลก',
-  tr: 'Yeni özet hazır — dünyada olup bitenlere hemen göz at.',
-  uk: 'Новий брифінг готовий — подивіться, що зараз коїться у світі.',
-  vi: 'Bản tóm tắt mới đã có — xem thế giới đang diễn ra điều gì.',
-  zh: '最新简报已就绪 — 看看世界正在发生什么。',
+/** Morning slot: what the reader slept through. */
+const MORNING_BODY_BY_LANG = Object.freeze({
+  ar: 'إليك ما حدث في العالم خلال الليل.',
+  ca: 'Mira què ha passat al món durant la nit.',
+  cs: 'Podívejte se, co se ve světě stalo přes noc.',
+  da: 'Se hvad der skete i verden i nat.',
+  de: 'Das ist über Nacht in der Welt passiert.',
+  el: 'Δες τι συνέβη στον κόσμο μέσα στη νύχτα.',
+  en: "Here's what happened around the world overnight.",
+  es: 'Mira qué pasó en el mundo durante la noche.',
+  fi: 'Katso, mitä maailmalla tapahtui yön aikana.',
+  fr: 'Voici ce qui s’est passé dans le monde cette nuit.',
+  he: 'הנה מה שקרה בעולם במהלך הלילה.',
+  hi: 'देखें रात भर दुनिया में क्या हुआ।',
+  hr: 'Pogledajte što se u svijetu dogodilo tijekom noći.',
+  hu: 'Nézd meg, mi történt a világban az éjjel.',
+  id: 'Lihat apa yang terjadi di dunia semalam.',
+  it: 'Ecco cosa è successo nel mondo durante la notte.',
+  ja: '夜のあいだに世界で起きたことをまとめました。',
+  ko: '밤사이 세계에서 일어난 일을 확인하세요.',
+  ms: 'Lihat apa yang berlaku di dunia semalaman.',
+  nb: 'Se hva som skjedde i verden i natt.',
+  nl: 'Dit is er vannacht in de wereld gebeurd.',
+  pl: 'Zobacz, co wydarzyło się na świecie w nocy.',
+  pt: 'Veja o que aconteceu no mundo durante a noite.',
+  ro: 'Vezi ce s-a întâmplat în lume peste noapte.',
+  ru: 'Вот что произошло в мире за ночь.',
+  sk: 'Pozrite, čo sa vo svete stalo cez noc.',
+  sl: 'Poglejte, kaj se je ponoči zgodilo po svetu.',
+  sv: 'Se vad som hände i världen i natt.',
+  th: 'ดูว่าเมื่อคืนเกิดอะไรขึ้นบ้างทั่วโลก',
+  tr: 'Dün gece dünyada neler olduğuna bak.',
+  uk: 'Ось що сталося у світі за ніч.',
+  vi: 'Xem những gì đã xảy ra trên thế giới đêm qua.',
+  zh: '看看昨夜世界发生了什么。',
+});
+
+/** Evening slot: where things stand as the day closes. */
+const EVENING_BODY_BY_LANG = Object.freeze({
+  ar: 'مع نهاية اليوم — إليك حال العالم الآن.',
+  ca: 'A punt d’acabar el dia: així està el món ara.',
+  cs: 'Den se chýlí ke konci — takhle na tom svět je.',
+  da: 'Dagen slutter – sådan står verden nu.',
+  de: 'Der Tag geht zu Ende – so steht die Welt gerade.',
+  el: 'Η μέρα κλείνει — δες πού βρίσκεται ο κόσμος.',
+  en: "The day is closing — here's where the world stands.",
+  es: 'Termina el día: así está el mundo ahora.',
+  fi: 'Päivä kääntyy iltaan – tässä maailman tilanne.',
+  fr: 'La journée se termine — voici où en est le monde.',
+  he: 'היום מסתיים — הנה מצב העולם עכשיו.',
+  hi: 'दिन खत्म हो रहा है — देखें दुनिया कहाँ खड़ी है।',
+  hr: 'Dan se bliži kraju — evo gdje je svijet sada.',
+  hu: 'Véget ér a nap – így áll most a világ.',
+  id: 'Hari hampir berakhir — begini keadaan dunia sekarang.',
+  it: 'La giornata si chiude: ecco come sta il mondo.',
+  ja: '一日の終わりに、いまの世界の状況をどうぞ。',
+  ko: '하루가 저물어요 — 지금 세계의 상황입니다.',
+  ms: 'Hari hampir berakhir — beginilah keadaan dunia kini.',
+  nb: 'Dagen er over – slik står verden nå.',
+  nl: 'De dag loopt ten einde – zo staat de wereld ervoor.',
+  pl: 'Dzień się kończy — oto jak wygląda świat.',
+  pt: 'O dia está acabando — veja como está o mundo agora.',
+  ro: 'Ziua se încheie — iată cum stă lumea acum.',
+  ru: 'День подходит к концу — вот положение дел в мире.',
+  sk: 'Deň sa končí — takto je na tom svet.',
+  sl: 'Dan se izteka — takšno je stanje v svetu.',
+  sv: 'Dagen är slut – så ser världen ut nu.',
+  th: 'วันกำลังจะจบ — มาดูสถานการณ์โลกตอนนี้',
+  tr: 'Gün biterken dünyada durum ne, özetine göz at.',
+  uk: 'День добігає кінця — ось стан справ у світі.',
+  vi: 'Ngày sắp khép lại — thế giới đang ra sao.',
+  zh: '一天将尽 — 看看此刻的世界。',
 });
 
 /**
- * Prefixed onto the title, not baked into TITLE_BY_LANG, so the strings stay
- * byte-identical to the String Catalog and a re-extraction stays a clean diff.
+ * Prefixed onto the title rather than baked into TITLE_BY_LANG, so the strings
+ * stay byte-identical to the String Catalog and a re-extraction is a clean
+ * diff. The emoji is also what tells the two slots apart at a glance, since
+ * both carry the same feature name.
  */
-const TITLE_EMOJI = '🌍';
+const SLOTS = Object.freeze({
+  morning: Object.freeze({ emoji: '🌅', bodies: MORNING_BODY_BY_LANG, envKey: 'BRIEF_PUSH_MORNING_HOUR', defaultHour: DEFAULT_MORNING_HOUR }),
+  evening: Object.freeze({ emoji: '🌆', bodies: EVENING_BODY_BY_LANG, envKey: 'BRIEF_PUSH_EVENING_HOUR', defaultHour: DEFAULT_EVENING_HOUR }),
+});
 
 function envFlag(env, key, fallback = false) {
   const raw = env[key];
@@ -158,10 +222,35 @@ function envFlag(env, key, fallback = false) {
   return raw === '1' || raw === 'true';
 }
 
-function envInt(env, key, fallback, min) {
+function envInt(env, key, fallback, min, max) {
   const n = Number(env[key]);
   if (!Number.isFinite(n)) return fallback;
-  return Math.max(min, Math.trunc(n));
+  return Math.min(max, Math.max(min, Math.trunc(n)));
+}
+
+/** Local hour in an IANA zone, 0-23. */
+function localHour(timeZone, at) {
+  const parts = new Intl.DateTimeFormat('en-US', { timeZone, hour: 'numeric', hour12: false }).format(at);
+  // hour12:false renders midnight as "24" in some ICU versions.
+  return Number(parts) % 24;
+}
+
+/**
+ * Every IANA zone whose local clock currently reads `hour`.
+ *
+ * Matching the hour and not hour+minute is deliberate: a UTC-aligned cron never
+ * observes Asia/Kolkata (+5:30) or Asia/Kathmandu (+5:45) at exactly 10:00, so
+ * a minute-precise match would silently exclude every half-hour-offset country.
+ */
+function zonesAtLocalHour(hour, at = new Date(), zones = null) {
+  const all = zones ?? (typeof Intl.supportedValuesOf === 'function' ? Intl.supportedValuesOf('timeZone') : []);
+  const out = [];
+  for (const zone of all) {
+    try {
+      if (localHour(zone, at) === hour) out.push(zone);
+    } catch { /* an ICU build without this zone simply cannot have devices in it */ }
+  }
+  return out;
 }
 
 /**
@@ -169,14 +258,15 @@ function envInt(env, key, fallback, min) {
  * maps and falls back to `.en`, so `en` must always be present — it is the
  * fallback for every locale the app ships that is not listed here.
  */
-function localizedTitle() {
+function localizedTitle(slot) {
+  const { emoji } = SLOTS[slot];
   const out = {};
-  for (const [lang, value] of Object.entries(TITLE_BY_LANG)) out[lang] = `${TITLE_EMOJI} ${value}`;
+  for (const [lang, value] of Object.entries(TITLE_BY_LANG)) out[lang] = `${emoji} ${value}`;
   return out;
 }
 
-function localizedBody() {
-  return { ...BODY_BY_LANG };
+function localizedBody(slot) {
+  return { ...SLOTS[slot].bodies };
 }
 
 /**
@@ -186,26 +276,31 @@ function localizedBody() {
  *          del:(k:string)=>Promise<unknown>}} deps.redis
  * @param {typeof fetch} [deps.fetchImpl]
  * @param {{log:Function,warn:Function}} [deps.log]
+ * @param {()=>Date} [deps.now]
+ * @param {string[]} [deps.timeZones] override the zone universe, for tests
  */
-function createBriefPushNotifier({ env, redis, fetchImpl, log = console }) {
+function createBriefPushNotifier({ env, redis, fetchImpl, log = console, now = () => new Date(), timeZones = null }) {
   const doFetch = fetchImpl ?? globalThis.fetch;
   const secret = env.PUSH_ADMIN_SECRET ?? '';
   const baseUrl = (env.BRIEF_PUSH_BASE_URL || DEFAULT_BASE_URL).replace(/\/+$/, '');
   const armed = envFlag(env, 'BRIEF_PUSH_ENABLED');
   const dryRun = env.BRIEF_PUSH_DRY_RUN !== '0';
-  const minGapS = envInt(env, 'BRIEF_PUSH_MIN_GAP_S', DEFAULT_MIN_GAP_S, 0);
-  const pageSize = envInt(env, 'BRIEF_PUSH_PAGE_SIZE', DEFAULT_PAGE_SIZE, 1);
-  const maxPages = envInt(env, 'BRIEF_PUSH_MAX_PAGES', DEFAULT_MAX_PAGES, 1);
+  const pageSize = envInt(env, 'BRIEF_PUSH_PAGE_SIZE', DEFAULT_PAGE_SIZE, 1, 20_000);
+  const maxPages = envInt(env, 'BRIEF_PUSH_MAX_PAGES', DEFAULT_MAX_PAGES, 1, 1000);
   const sandbox = String(env.APNS_ENVIRONMENT ?? '').toLowerCase() === 'sandbox';
   const cohorts = String(env.BRIEF_PUSH_COHORTS ?? '')
     .split(',')
     .map((c) => c.trim().toLowerCase())
     .filter(Boolean);
   const audienceCohorts = cohorts.length ? cohorts : [...DEFAULT_COHORTS];
+  const slotHours = Object.freeze({
+    morning: envInt(env, SLOTS.morning.envKey, SLOTS.morning.defaultHour, 0, 23),
+    evening: envInt(env, SLOTS.evening.envKey, SLOTS.evening.defaultHour, 0, 23),
+  });
 
   const enabled = armed && !!secret && typeof doFetch === 'function';
   const config = Object.freeze({
-    enabled, armed, dryRun, sandbox, baseUrl, minGapS, pageSize, maxPages,
+    enabled, armed, dryRun, sandbox, baseUrl, pageSize, maxPages, slotHours,
     cohorts: audienceCohorts, hasSecret: !!secret,
   });
 
@@ -233,9 +328,9 @@ function createBriefPushNotifier({ env, redis, fetchImpl, log = console }) {
 
   /**
    * The send endpoint is a Vercel function with a wall-clock ceiling and pages
-   * its audience; this cron has no such ceiling, so the loop belongs here.
-   * `pages` is reported on failure because it decides whether the caller may
-   * release its gap key: once a page has landed, retrying double-sends.
+   * its audience; this cron has none, so the loop belongs here. `pages` is
+   * reported on failure because it decides whether the caller may release its
+   * dedup key: once a page has landed, retrying double-sends.
    */
   async function pageThrough(basePayload) {
     let cursor = null;
@@ -252,9 +347,7 @@ function createBriefPushNotifier({ env, redis, fetchImpl, log = console }) {
       } catch (e) {
         return { ok: false, pages, matched, sent, reason: e?.message || String(e) };
       }
-      if (result.status !== 200) {
-        return { ok: false, pages, matched, sent, status: result.status };
-      }
+      if (result.status !== 200) return { ok: false, pages, matched, sent, status: result.status };
       matched += Number(result.json?.matched ?? 0);
       sent += Number(result.json?.sent ?? 0);
       pages += 1;
@@ -271,23 +364,23 @@ function createBriefPushNotifier({ env, redis, fetchImpl, log = console }) {
     }
   }
 
-  function buildPayload() {
+  function buildPayload(slot, zones) {
     return {
       audience: {
         priority: [...audienceCohorts],
         // Deliberately false: an unset priority means the iOS default
-        // (`medium`), and `medium` promises severity filtering a digest cannot
-        // meet. Those users are not opted in to this.
+        // (`medium`), which promises severity filtering a digest cannot meet.
         includeUnsetPriority: false,
+        timezone: zones,
         limit: pageSize,
       },
-      alert: { title: localizedTitle(), body: localizedBody() },
-      // PushRoute.brief -> the World Report tab with the AI brief opened, so the
-      // tap lands on the thing the banner is talking about.
+      alert: { title: localizedTitle(slot), body: localizedBody(slot) },
+      // PushRoute.brief -> World Report with the AI brief opened, so the tap
+      // lands on the thing the banner is talking about.
       route: { type: 'brief' },
-      // Collapses an older unread brief banner instead of stacking them: only
-      // the newest brief is worth opening.
-      collapseId: 'brief',
+      // Per slot, so the evening banner replaces an unread morning one rather
+      // than stacking two digests on the lock screen.
+      collapseId: `brief-${slot}`,
       // 5, not 10: a digest is not time-critical, and this lets iOS batch the
       // delivery rather than waking the device.
       priority: 5,
@@ -297,61 +390,84 @@ function createBriefPushNotifier({ env, redis, fetchImpl, log = console }) {
     };
   }
 
+  async function runSlot(slot, at) {
+    const hour = slotHours[slot];
+    const zones = zonesAtLocalHour(hour, at, timeZones);
+    if (zones.length === 0) return { slot, action: 'skipped', reason: `no zone at local ${hour}:00` };
+
+    // Keyed on the UTC hour, not the slot alone: each hourly tick serves a
+    // DIFFERENT band of zones, so a global daily key would let the first band
+    // through and silently starve the other 23. This only has to stop the same
+    // tick running twice.
+    const utcStamp = `${at.toISOString().slice(0, 13)}`;
+    const dedupKey = `${KEY_PREFIX}:${slot}:${utcStamp}`;
+    const claim = await redis.setNx(dedupKey, String(zones.length), SLOT_DEDUP_TTL_S);
+    if (claim !== 'new') {
+      // Fails closed like every other guard here: an unreachable Redis must not
+      // turn an hourly cron into an hourly notification.
+      return {
+        slot,
+        action: 'suppressed',
+        reason: claim === 'duplicate' ? 'already sent this tick' : `dedup unavailable (${claim})`,
+      };
+    }
+
+    const result = await pageThrough(buildPayload(slot, zones));
+
+    if (!result.ok) {
+      const nothingSent = result.pages === 0;
+      const releasable = result.status === undefined || RELEASABLE_STATUSES.has(result.status);
+      if (nothingSent && releasable) {
+        try { await redis.del(dedupKey); } catch { /* the TTL will clear it */ }
+        log.warn?.(`[BriefPush] ${slot}: failed before any page landed, key released: ${result.reason ?? `HTTP ${result.status}`}`);
+      } else {
+        log.warn?.(`[BriefPush] ${slot}: PARTIAL — ${result.matched} reached over ${result.pages} page(s), then ${result.reason ?? `HTTP ${result.status}`}`);
+      }
+      return { slot, action: 'error', reason: result.reason ?? `HTTP ${result.status}`, pages: result.pages, matched: result.matched };
+    }
+
+    log.log?.(
+      `[BriefPush] ${dryRun ? 'DRY-RUN' : 'SENT'} ${slot} (local ${hour}:00, ${zones.length} zones) ` +
+      `-> priority[${audienceCohorts.join(',')}] matched=${result.matched}` +
+      `${dryRun ? '' : ` sent=${result.sent}`}${result.complete ? '' : ' (TRUNCATED)'}`,
+    );
+    return {
+      slot,
+      action: dryRun ? 'dry-run' : 'sent',
+      hour,
+      zones: zones.length,
+      matched: result.matched,
+      sent: result.sent,
+      pages: result.pages,
+      complete: result.complete,
+    };
+  }
+
   /**
-   * Announce a freshly published brief.
+   * Announce a freshly published brief to whichever zones have just rolled into
+   * a slot hour. Usually neither slot matches and this is a cheap no-op; that
+   * is the normal case, since only 2 of 24 hourly ticks reach a given zone.
    *
-   * @param {{generatedAt?: number|string}} [brief] identity of the published
-   *   snapshot; only used to make the log line traceable.
-   * @returns {Promise<{action:string, reason?:string, matched?:number, sent?:number}>}
+   * @returns {Promise<{action:string, slots?:object[]}>}
    */
-  async function notifyPublished(brief = {}) {
+  async function notifyPublished() {
     try {
       if (!enabled) {
         return { action: 'disabled', reason: !armed ? 'BRIEF_PUSH_ENABLED not set' : 'PUSH_ADMIN_SECRET not set' };
       }
-
-      const claimed = [];
-      if (minGapS > 0) {
-        const gapKey = `${KEY_PREFIX}:gap`;
-        const gap = await redis.setNx(gapKey, String(brief.generatedAt ?? ''), minGapS);
-        if (gap !== 'new') {
-          // Fails closed like the broadcast guards: an unreachable Redis must
-          // not turn an hourly cron into an hourly notification.
-          return {
-            action: 'suppressed',
-            reason: gap === 'duplicate' ? 'inside min-gap window' : `gap unavailable (${gap})`,
-          };
-        }
-        claimed.push(gapKey);
+      const at = now();
+      const slots = [];
+      for (const slot of Object.keys(SLOTS)) {
+        // Sequential on purpose: the two slots share the send endpoint's
+        // capacity, and at most one of them normally has any zones at all.
+        slots.push(await runSlot(slot, at));
       }
-
-      const result = await pageThrough(buildPayload());
-
-      if (!result.ok) {
-        const nothingSent = result.pages === 0;
-        const releasable = result.status === undefined || RELEASABLE_STATUSES.has(result.status);
-        if (nothingSent && releasable) {
-          for (const key of claimed) {
-            try { await redis.del(key); } catch { /* the TTL will clear it */ }
-          }
-          log.warn?.(`[BriefPush] failed before any page landed, gap released: ${result.reason ?? `HTTP ${result.status}`}`);
-        } else {
-          log.warn?.(`[BriefPush] PARTIAL — ${result.matched} reached over ${result.pages} page(s), then ${result.reason ?? `HTTP ${result.status}`}`);
-        }
-        return { action: 'error', reason: result.reason ?? `HTTP ${result.status}`, pages: result.pages, matched: result.matched };
-      }
-
-      log.log?.(
-        `[BriefPush] ${dryRun ? 'DRY-RUN' : 'SENT'} -> priority[${audienceCohorts.join(',')}] ` +
-        `matched=${result.matched}${dryRun ? '' : ` sent=${result.sent}`} over ${result.pages} page(s)` +
-        `${result.complete ? '' : ' (TRUNCATED)'}`,
-      );
+      const delivered = slots.filter((s) => s.action === 'sent' || s.action === 'dry-run');
       return {
-        action: dryRun ? 'dry-run' : 'sent',
-        matched: result.matched,
-        sent: result.sent,
-        pages: result.pages,
-        complete: result.complete,
+        action: delivered.length ? delivered[0].action : 'skipped',
+        slots,
+        matched: delivered.reduce((n, s) => n + (s.matched ?? 0), 0),
+        sent: delivered.reduce((n, s) => n + (s.sent ?? 0), 0),
       };
     } catch (e) {
       log.warn?.(`[BriefPush] notify failed: ${e?.message || e}`);
@@ -359,17 +475,21 @@ function createBriefPushNotifier({ env, redis, fetchImpl, log = console }) {
     }
   }
 
-  return { notifyPublished, config };
+  return { notifyPublished, runSlot, config };
 }
 
 module.exports = {
   createBriefPushNotifier,
   localizedTitle,
   localizedBody,
+  zonesAtLocalHour,
+  localHour,
+  SLOTS,
   TITLE_BY_LANG,
-  BODY_BY_LANG,
-  TITLE_EMOJI,
+  MORNING_BODY_BY_LANG,
+  EVENING_BODY_BY_LANG,
   DEFAULT_COHORTS,
-  DEFAULT_MIN_GAP_S,
+  DEFAULT_MORNING_HOUR,
+  DEFAULT_EVENING_HOUR,
   RELEASABLE_STATUSES,
 };
