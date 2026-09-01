@@ -397,8 +397,10 @@ describe('citation-scoped composer gates (#4928 external review)', () => {
         { n: 2, text: 'Turkey raises interest rates to 50% [2].' },
       ],
     });
-    assert.equal(composeSynthesizedBrief(misattributed, STORIES2, passOpts), null,
+    const composed = composeSynthesizedBrief(misattributed, STORIES2, passOpts);
+    assert.equal(composed.droppedLeadSentences, 1,
       'Turkey facts cited to [1] (Iran) must fail citation-scoped validation');
+    assert.doesNotMatch(composed.lead, /Turkey/, 'the misattributed claim must not ship');
   });
 
   it('REGRESSION: an uncited lead sentence rejects the synthesis (every claim cited)', () => {
@@ -409,7 +411,9 @@ describe('citation-scoped composer gates (#4928 external review)', () => {
         { n: 2, text: 'Turkey raises interest rates to 50% [2].' },
       ],
     });
-    assert.equal(composeSynthesizedBrief(uncited, STORIES2, passOpts), null);
+    const composed = composeSynthesizedBrief(uncited, STORIES2, passOpts);
+    assert.equal(composed.droppedLeadSentences, 1);
+    assert.doesNotMatch(composed.lead, /Markets/, 'the uncited claim must not ship');
   });
 
   it('REGRESSION: a line carrying the WRONG in-range citation is rewritten to its own [n]', () => {
@@ -511,12 +515,14 @@ describe('fragmented-cluster leads (#6001)', () => {
     // The exact production rejection: nouns ["kyiv"], cited [3]. "Kyiv" is
     // absent from story 3 ("Ukrainian capital") and present only in story 7.
     const out = compose(`Russia struck Kyiv with missiles and drones, killing at least 9 [3]. ${DOHA}`);
-    assert.equal(out, null, 'a fact drawn from an uncited sibling must not ship');
+    assert.equal(out.droppedLeadSentences, 1);
+    assert.doesNotMatch(out.lead, /Kyiv/, 'a fact drawn from an uncited sibling must not ship');
   });
 
   it('rejects a sibling-only numeric fact when proper nouns are grounded', () => {
     const out = compose(`Russia struck the Ukrainian capital, killing nine [3]. ${DOHA}`);
-    assert.equal(out, null, 'a casualty count drawn from an uncited sibling must not ship');
+    assert.equal(out.droppedLeadSentences, 1);
+    assert.doesNotMatch(out.lead, /killing nine/, 'a casualty count from an uncited sibling must not ship');
   });
 
   it('accepts a sibling numeric fact once both fragments are cited', () => {
@@ -536,13 +542,15 @@ describe('fragmented-cluster leads (#6001)', () => {
     // but the claim binds to [6] (Venezuela). Citation-scoped grounding is
     // the only thing that catches it, and #6001 must not relax it.
     const out = compose(`A magnitude 6.8 earthquake struck northern Chile [6]. ${DOHA}`);
-    assert.equal(out, null, '#4928 misattribution protection must survive #6001');
+    assert.equal(out.droppedLeadSentences, 1);
+    assert.doesNotMatch(out.lead, /Chile/, '#4928 misattribution protection must survive #6001');
   });
 
   it('rejects an invented proper noun even when every slot is cited', () => {
     const allCited = STORIES6001.map((_, i) => `[${i + 1}]`).join('');
     const out = compose(`Belarus opened a second front against Latvia ${allCited}. ${DOHA}`);
-    assert.equal(out, null, 'citing everything must not launder a hallucination');
+    assert.equal(out.droppedLeadSentences, 1);
+    assert.doesNotMatch(out.lead, /Belarus/, 'citing everything must not launder a hallucination');
   });
 
   it('system prompt tells the model to cite EVERY story a claim draws from', () => {

@@ -414,7 +414,9 @@ test('the composer rejection reason reaches the failure code through the real se
     INSIGHTS_SYNTHESIS_FAILURE_CODES.LEAD_NUMERIC_FACT,
   );
   assert.equal(
-    resolve('Prices rose sharply in Chile last quarter [1]. Analysts expect more ahead.').failureCode,
+    // Every sentence uncited: nothing survives the drop, so the composer still
+    // refuses and the seam still reports WHICH gate refused.
+    resolve('Prices rose sharply in Chile last quarter. Analysts expect more ahead.').failureCode,
     INSIGHTS_SYNTHESIS_FAILURE_CODES.LEAD_UNCITED,
   );
   assert.equal(

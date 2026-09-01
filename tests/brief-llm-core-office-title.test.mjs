@@ -212,7 +212,28 @@ describe('brief grounding gate — office titles vs invented names', () => {
       assert.ok(r.brief.lead.includes("India's PM"));
     });
 
-    it('a lead that invents a name is STILL dropped end-to-end', () => {
+    it('a lead sentence that invents a name is dropped, the rest still ships', () => {
+      const raw = JSON.stringify({
+        lead: 'Indian PM Modi asked Putin to end the Ukraine war [1]. '
+          + "India's PM Gandhi pressed Putin on the same day [1]. "
+          + 'The EU agreed a new sanctions package targeting Russian oil exports [2].',
+        lines: [
+          { n: 1, text: 'Modi pressed Putin to end the war' },
+          { n: 2, text: 'EU targets Russian oil exports' },
+        ],
+      });
+      const r = composeSynthesizedBriefResult(raw, stories, { briefCluster: stories[0] });
+      assert.equal(r.rejection, null, 'the grounded sentences carry the brief');
+      assert.equal(r.brief.droppedLeadSentences, 1);
+      assert.doesNotMatch(r.brief.lead, /Gandhi/, 'the invented name must not ship');
+      assert.match(r.brief.lead, /^Indian PM Modi .* The EU agreed .*\[2\]\.$/);
+    });
+
+    it('a survivor that no longer anchors to the corpus is still refused', () => {
+      // Dropping a sentence must not be able to smuggle a brief past the
+      // anchor floor: checkLeadGrounding judges what SHIPS, so a lead whose
+      // remaining text falls below the anchor threshold is refused outright
+      // rather than published thin.
       const raw = JSON.stringify({
         lead: "India's PM Gandhi asked Putin to end the Ukraine war [1]. "
           + 'The EU agreed a new sanctions package targeting Russian oil exports [2].',
@@ -222,7 +243,7 @@ describe('brief grounding gate — office titles vs invented names', () => {
         ],
       });
       const r = composeSynthesizedBriefResult(raw, stories, { briefCluster: stories[0] });
-      assert.equal(r.rejection, 'lead-proper-noun');
+      assert.equal(r.rejection, 'lead-grounding');
       assert.equal(r.brief, null);
     });
   });

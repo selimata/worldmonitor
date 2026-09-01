@@ -1030,6 +1030,15 @@ async function fetchInsights() {
     if (composed.hallucinatedLines > 0) {
       console.warn(`  [brief_hallucination ${BRIEF_VALIDATOR_MODE.toUpperCase()}] ${composed.hallucinatedLines}/${topStories.length} synthesis lines flagged`);
     }
+    if (composed.droppedLeadSentences > 0) {
+      // #6521: a lead sentence that fails a gate is now dropped rather than
+      // costing the whole brief, so this counter is the ONLY signal that a gate
+      // fired on the lead at all — the run no longer reports a rejection. A
+      // brief that quietly sheds a sentence every tick is a prompt or corpus
+      // problem; without this it looks like a clean run. The offending text is
+      // deliberately not logged (these reach seed-meta and Railway logs).
+      console.warn(`  [brief_lead_drop ${BRIEF_VALIDATOR_MODE.toUpperCase()}] dropped ${composed.droppedLeadSentences} ungrounded lead sentence(s); published the rest`);
+    }
     if (composed.sourceAttributions > 0) {
       // Accept-side counterpart to the `validate_reject` reason below: how many
       // lead sentences named their own outlet. Only the reject path was ever

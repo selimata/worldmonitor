@@ -29,6 +29,16 @@ import {
 // story — the exact #4928 misattribution the review below fails closed on.
 // Requiring the run to close the sentence keeps the merge citation-neutral: the
 // fragment can only ever join the citation it already owned.
+// Shortest lead `parseBriefSynthesis` will accept. Shared with the survivor
+// floor below so dropping a sentence can never publish a lead the parser
+// would have refused outright.
+const MIN_LEAD_CHARS = 40;
+
+// Same width as the '.' it replaces (see `maskedLead`). A model that somehow
+// emitted this control character disables sentence dropping rather than
+// risking a mis-sliced lead.
+const DOT_SENTINEL = '\u0001';
+
 const MIDSENTENCE_DOTTED_ACRONYM = /\b[A-Z]\.(?:[A-Z]\.?)+(?=\s+(?:\p{Ll}|(?:\[\d{1,3}\])+(?:[.!?]|$)))/gu;
 
 /**
@@ -180,7 +190,7 @@ export function parseBriefSynthesis(rawText, storyCount) {
     return null;
   }
   const lead = typeof parsed?.lead === 'string' ? parsed.lead.trim() : '';
-  if (lead.length < 40 || lead.length > 700) return null;
+  if (lead.length < MIN_LEAD_CHARS || lead.length > 700) return null;
   const rawLines = Array.isArray(parsed?.lines) ? parsed.lines : [];
   const byIndex = new Map();
   for (const entry of rawLines) {
@@ -328,6 +338,7 @@ function maskAttributedSourcesResult(text, sources) {
  *   hallucinatedLines: number;
  *   strippedCitations: number;
  *   sourceAttributions: number;
+ *   droppedLeadSentences: number;
  * }} null → caller falls back to the legacy single-headline path.
  *
  * #5947: the seeder now calls `composeSynthesizedBriefResult` below so it can
@@ -424,22 +435,78 @@ export function composeSynthesizedBriefResult(rawText, topStories, opts = {}) {
   // uncited sentence ride inside a cited one. Ambiguity must fail closed. Only
   // the gate's view changes — the published lead below stays leadCheck.text,
   // punctuation intact.
-  const leadSentences = leadCheck.text
-    .replace(MIDSENTENCE_DOTTED_ACRONYM, (acronym) => acronym.replace(/\./g, ''))
-    .split(/(?<=[.!?])\s+/)
-    .filter((sentence) => sentence.trim().length > 0);
-  if (leadSentences.length === 0) return reject(BRIEF_REJECTIONS.LEAD_EMPTY);
-  for (const sentence of leadSentences) {
+  // The gate reads a DIFFERENT string than the one we publish: dotted acronyms
+  // are collapsed so "U.S." is not misread as a sentence boundary. Collapsing
+  // shortens the text, which would shift every offset after it, so the mask
+  // below swaps each dot for a same-width sentinel instead of deleting it.
+  // masked.length === leadCheck.text.length then holds, and ONE split yields
+  // both views: the gate's (sentinels removed — byte-identical to the string
+  // this loop used to validate) and the published one (sliced from the
+  // original, punctuation intact).
+  const maskedLead = leadCheck.text.replace(
+    MIDSENTENCE_DOTTED_ACRONYM,
+    (acronym) => acronym.replace(/\./g, DOT_SENTINEL),
+  );
+  // Both conditions are unreachable for a length-preserving mask over model
+  // prose; they exist so an unexpected input degrades to the old all-or-nothing
+  // behavior rather than publishing a lead sliced at the wrong offsets.
+  const canDropLeadSentences = maskedLead.length === leadCheck.text.length
+    && !leadCheck.text.includes(DOT_SENTINEL);
+
+  const leadSpans = [];
+  {
+    const boundary = /(?<=[.!?])\s+/g;
+    let cursor = 0;
+    let match = boundary.exec(maskedLead);
+    while (match !== null) {
+      leadSpans.push([cursor, match.index]);
+      cursor = boundary.lastIndex;
+      match = boundary.exec(maskedLead);
+    }
+    leadSpans.push([cursor, maskedLead.length]);
+  }
+  const leadUnits = leadSpans
+    .map(([from, to]) => ({
+      gate: maskedLead.slice(from, to).replaceAll(DOT_SENTINEL, ''),
+      published: leadCheck.text.slice(from, to),
+    }))
+    .filter((unit) => unit.gate.trim().length > 0);
+  if (leadUnits.length === 0) return reject(BRIEF_REJECTIONS.LEAD_EMPTY);
+
+  // #6521: a lead failure used to drop the WHOLE brief while a per-story line
+  // failure only degraded that line. On 2026-08-31 CNBC re-worded one headline
+  // in place and a single unsupported phrase in one lead sentence ended 4.5h of
+  // runs in "=== Done (no write) ===". Drop the offending SENTENCE instead and
+  // publish what survives. The invariant is unchanged — no ungrounded claim
+  // ships, every published sentence passed the same three gates it always did.
+  // Only the blast radius shrinks, from the brief to the sentence.
+  //
+  // The all-fail case still rejects, carrying the FIRST sentence's reason and
+  // detail so existing alarms and the #5947 rejection vocabulary keep working.
+  // May 19 stays caught for exactly this reason: that lead was ONE sentence, so
+  // dropping it leaves nothing and the brief is refused as before.
+  const keptLead = [];
+  let firstDropRejection = null;
+  let firstDropDetail = null;
+  const dropSentence = (rejection, detail = null) => {
+    if (firstDropRejection === null) {
+      firstDropRejection = rejection;
+      firstDropDetail = detail;
+    }
+  };
+
+  for (const unit of leadUnits) {
+    const sentence = unit.gate;
     const cited = [...sentence.matchAll(/\[(\d{1,3})\]/g)]
       .map((match) => Number.parseInt(match[1], 10))
       .filter((n) => n >= 1 && n <= topStories.length);
     // Contract: every claim is cited. An uncited sentence is unverifiable.
-    if (cited.length === 0) return reject(BRIEF_REJECTIONS.LEAD_UNCITED);
+    if (cited.length === 0) { dropSentence(BRIEF_REJECTIONS.LEAD_UNCITED); continue; }
     const scopedGround = cited.map((n) => storyGroundText(topStories[n - 1])).join(' — ');
     // Fail CLOSED on empty ground. Both validators return ok:true for an empty
     // ground string, so an untitled cluster would accept every proper noun and
     // every number in the sentence — a dead gate that looks like a healthy one.
-    if (!scopedGround.trim()) return reject(BRIEF_REJECTIONS.LEAD_GROUNDING);
+    if (!scopedGround.trim()) { dropSentence(BRIEF_REJECTIONS.LEAD_GROUNDING); continue; }
     // The lead may NAME the outlets of the stories it cites — the prompt showed
     // it those labels. Blank them so they ground nothing else, scoped to the
     // cited stories so one story's outlet cannot license a claim about another.
@@ -448,21 +515,42 @@ export function composeSynthesizedBriefResult(rawText, topStories, opts = {}) {
       cited.map((n) => topStories[n - 1]?.primarySource),
     );
     const attributed = attribution.text;
-    if (attribution.matches > 0) sourceAttributions++;
     // Both validators still run before either can reject, so shadow mode
     // observes exactly what it observed before the reasons were split out.
     const sentenceValidation = validateNoHallucinatedProperNouns(attributed, scopedGround);
     const factValidation = validateNoHallucinatedFacts(attributed, scopedGround);
     if (validatorMode === 'enforce') {
       if (!sentenceValidation.ok) {
-        return reject(BRIEF_REJECTIONS.LEAD_PROPER_NOUN, sentenceValidation.hallucinated);
+        dropSentence(BRIEF_REJECTIONS.LEAD_PROPER_NOUN, sentenceValidation.hallucinated);
+        continue;
       }
       if (!factValidation.ok) {
-        return reject(BRIEF_REJECTIONS.LEAD_NUMERIC_FACT, factValidation.hallucinated);
+        dropSentence(BRIEF_REJECTIONS.LEAD_NUMERIC_FACT, factValidation.hallucinated);
+        continue;
       }
     }
+    // Counted only for a sentence that actually ships. Under the old
+    // all-or-nothing flow a rejected sentence discarded this tally with the
+    // rest of the result, so an accepted brief never carried a dropped
+    // sentence's attribution.
+    if (attribution.matches > 0) sourceAttributions++;
+    keptLead.push(unit.published);
   }
-  if (!checkLeadGrounding({ lead: leadCheck.text }, groundingStories, topStories.length)) {
+
+  const droppedLeadSentences = leadUnits.length - keptLead.length;
+  if (droppedLeadSentences > 0 && !canDropLeadSentences) {
+    return reject(firstDropRejection, firstDropDetail);
+  }
+  if (keptLead.length === 0) return reject(firstDropRejection, firstDropDetail);
+  // Nothing dropped -> publish the ORIGINAL string, not a re-join. Keeps the
+  // happy path byte-identical, inter-sentence whitespace included.
+  const leadText = droppedLeadSentences === 0 ? leadCheck.text : keptLead.join(' ').trim();
+  // A survivor shorter than the parser's own floor is not a brief.
+  if (leadText.length < MIN_LEAD_CHARS) return reject(firstDropRejection, firstDropDetail);
+
+  // Anchor grounding is the overall floor and must judge what SHIPS, not what
+  // the model wrote.
+  if (!checkLeadGrounding({ lead: leadText }, groundingStories, topStories.length)) {
     return reject(BRIEF_REJECTIONS.LEAD_GROUNDING);
   }
 
@@ -506,7 +594,10 @@ export function composeSynthesizedBriefResult(rawText, topStories, opts = {}) {
   });
 
   return {
-    brief: { lead: leadCheck.text, lines, sources, hallucinatedLines, strippedCitations, sourceAttributions },
+    brief: {
+      lead: leadText, lines, sources, hallucinatedLines, strippedCitations,
+      sourceAttributions, droppedLeadSentences,
+    },
     rejection: null,
     rejectionDetail: null,
   };
