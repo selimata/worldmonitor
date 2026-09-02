@@ -4514,6 +4514,19 @@ if (UPSTASH_ENABLED && process.env.BROADCAST_PUSH_ENABLED === '1') {
  * not run the RELAY_GATES_READY block, and a stale headline is far worse as a
  * broadcast banner than as a Live Activity refresh.
  */
+/**
+ * Broadcast's own staleness window — deliberately WIDER than RELAY_RECENCY_MS.
+ * The classify sweep itself runs on a ~15min cadence on top of RSS ingest lag,
+ * so a 15min publish-age wall silently dropped most stories: they were already
+ * older than the window by the first time the LLM ever saw them. 60min keeps
+ * "breaking" honest while accepting the pipeline's real latency. Env-tunable
+ * because the right value is editorial, not technical.
+ */
+const BROADCAST_PUSH_RECENCY_MS = Math.max(
+  60_000,
+  Number(process.env.BROADCAST_PUSH_RECENCY_MS || 60 * 60 * 1000),
+);
+
 function broadcastPushObserve(title, meta, level, variant) {
   if (!broadcastPushDispatcher || !title) return;
   if (!BROADCAST_PUSH_VARIANTS.has(variant)) return;
@@ -4521,13 +4534,25 @@ function broadcastPushObserve(title, meta, level, variant) {
     const source = meta?.source ?? '';
     if (shouldDropRelaySourceForTier(RELAY_GATES_READY, source, RELAY_TIER4_SOURCES)) return;
     const publishedAt = meta?.publishedAt;
-    if (publishedAt && Date.now() - publishedAt > RELAY_RECENCY_MS) return;
+    // Only critical|high reach this function, so per-drop logging stays a
+    // handful of lines per sweep — cheap insurance against the failure mode
+    // that has bitten this pipeline twice already: a silent no-op that reads
+    // exactly like "no news today".
+    if (publishedAt && Date.now() - publishedAt > BROADCAST_PUSH_RECENCY_MS) {
+      const ageMin = Math.round((Date.now() - publishedAt) / 60000);
+      console.log(`[BroadcastPush] skip stale (${ageMin}min old, ${level}): ${String(title).slice(0, 80)}`);
+      return;
+    }
     broadcastPushDispatcher.observe({
       title,
       level,
       link: meta?.link ?? '',
       source,
       publishedAt,
+    }).then((r) => {
+      if (r?.action === 'suppressed' || r?.action === 'skipped') {
+        console.log(`[BroadcastPush] ${r.action} (${r.reason}): ${String(title).slice(0, 80)}`);
+      }
     }).catch((e) => console.warn('[BroadcastPush] observe failed:', e?.message || e));
   } catch (e) {
     console.warn('[BroadcastPush] observe failed:', e?.message || e);

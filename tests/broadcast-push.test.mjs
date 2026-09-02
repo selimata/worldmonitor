@@ -637,9 +637,20 @@ describe('ais-relay.cjs wiring', () => {
     assert.match(fn.slice(0, 900), /shouldDropRelaySourceForTier\(RELAY_GATES_READY/);
   });
 
-  it('applies a recency gate the cached classify path does not provide', () => {
+  it('applies its own recency gate, wider than the 15min relay one', () => {
     const fn = aisRelaySrc.slice(aisRelaySrc.indexOf('function broadcastPushObserve'));
-    assert.match(fn.slice(0, 900), /RELAY_RECENCY_MS/);
+    assert.match(fn.slice(0, 1400), /BROADCAST_PUSH_RECENCY_MS/);
+    assert.match(
+      aisRelaySrc,
+      /BROADCAST_PUSH_RECENCY_MS \|\| 60 \* 60 \* 1000/,
+      'a 15min publish-age wall dropped most stories: the classify sweep itself is ~15min behind publish',
+    );
+  });
+
+  it('logs every drop — a silent no-op reads exactly like "no news today"', () => {
+    const fn = aisRelaySrc.slice(aisRelaySrc.indexOf('function broadcastPushObserve'));
+    assert.match(fn.slice(0, 2200), /skip stale/);
+    assert.match(fn.slice(0, 2200), /suppressed.*\|\|.*skipped|action === 'suppressed'/);
   });
 });
 
