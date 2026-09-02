@@ -718,3 +718,34 @@ describe('lib/apns.ts hardening', { skip: apnsLibSrc ? false : 'sibling repo not
     assert.match(apnsLibSrc, /\} finally \{[\s\S]*client\.close\(\)/);
   });
 });
+
+describe('variant scoping', () => {
+  const relaySrc = readFileSync(resolve(__dirname, '..', 'scripts', 'ais-relay.cjs'), 'utf-8');
+
+  it('only the world variant may broadcast', () => {
+    assert.match(
+      relaySrc,
+      /BROADCAST_PUSH_VARIANTS = new Set\(\s*\n?\s*\(process\.env\.BROADCAST_PUSH_VARIANTS \|\| 'full'\)/,
+      'the relay classifies each variant against its OWN feeds, so "high" for tech is noise for everyone else',
+    );
+    assert.match(relaySrc, /if \(!BROADCAST_PUSH_VARIANTS\.has\(variant\)\) return;/);
+  });
+
+  it('threads the variant through from both classify call sites', () => {
+    // Nested parens in the arguments defeat a regex, so match the exact lines.
+    assert.match(
+      relaySrc,
+      /broadcastPushObserve\(titleArr\[i\], allTitles\.get\(titleArr\[i\]\), level, variant\);/,
+      'cached-classification path must pass its variant',
+    );
+    assert.match(
+      relaySrc,
+      /broadcastPushObserve\(chunk\[idx\], meta, level, variant\);/,
+      'freshly-classified path must pass its variant',
+    );
+    assert.equal(
+      (relaySrc.match(/broadcastPushObserve\(/g) ?? []).length, 3,
+      'one declaration plus exactly two call sites — a third would bypass the variant guard',
+    );
+  });
+});

@@ -4157,7 +4157,7 @@ async function seedClassifyForVariant(variant, seenTitles) {
     // and re-served from cache must still be able to push once. The
     // dispatcher's Redis dedup makes the repeat visits free.
     if (level === 'critical' || level === 'high') {
-      broadcastPushObserve(titleArr[i], allTitles.get(titleArr[i]), level);
+      broadcastPushObserve(titleArr[i], allTitles.get(titleArr[i]), level, variant);
     }
     for (const code of matchCountryNamesInText(titleArr[i])) {
       if (!byCountry[code]) byCountry[code] = emptyLevel();
@@ -4255,7 +4255,7 @@ async function seedClassifyForVariant(variant, seenTitles) {
         if (level === 'critical') liveActivityObserve(chunk[idx], meta);
         // Same gate as the queue publish above, so a broadcast can never reach
         // a device for a story the PRO relay itself refused to fan out.
-        broadcastPushObserve(chunk[idx], meta, level);
+        broadcastPushObserve(chunk[idx], meta, level, variant);
       }
     }
 
@@ -4514,8 +4514,9 @@ if (UPSTASH_ENABLED && process.env.BROADCAST_PUSH_ENABLED === '1') {
  * not run the RELAY_GATES_READY block, and a stale headline is far worse as a
  * broadcast banner than as a Live Activity refresh.
  */
-function broadcastPushObserve(title, meta, level) {
+function broadcastPushObserve(title, meta, level, variant) {
   if (!broadcastPushDispatcher || !title) return;
+  if (!BROADCAST_PUSH_VARIANTS.has(variant)) return;
   try {
     const source = meta?.source ?? '';
     if (shouldDropRelaySourceForTier(RELAY_GATES_READY, source, RELAY_TIER4_SOURCES)) return;
@@ -4569,6 +4570,20 @@ function logBroadcastPushStatus() {
 // which an exactly-hourly timer would turn into a skipped slot for a whole
 // band of time zones.
 // ─────────────────────────────────────────────────────────────
+/**
+ * Which classify variants may reach the broadcast audience.
+ *
+ * The relay classifies each variant's own feed set separately
+ * (CLASSIFY_VARIANTS), and "high" means high WITHIN that variant — a Dev.to CVE
+ * write-up is genuinely top news for `tech` and noise for everyone else. The
+ * iOS app is the general World Monitor, so only `full` earns a broadcast.
+ * Without this the whole install base got every variant's headlines: a Dovecot
+ * auth-bypass analysis went to 125 devices as "Breaking News".
+ */
+const BROADCAST_PUSH_VARIANTS = new Set(
+  (process.env.BROADCAST_PUSH_VARIANTS || 'full').split(',').map((v) => v.trim()).filter(Boolean),
+);
+
 const BRIEF_PUSH_TICK_MS = 15 * 60 * 1000;
 const BRIEF_PUSH_INSIGHTS_KEY = 'news:insights:v1';
 /** Matches the client's own staleness gate: a brief older than this is not news. */

@@ -55,11 +55,14 @@ Inverting that gives the table in `scripts/lib/broadcast-push.cjs`:
 | `medium` | `low` |
 | `low`, `info` | nobody |
 
-**With the default `BROADCAST_PUSH_MIN_LEVEL=critical` this table does no
-filtering.** Only critical events pass the floor, and critical reaches all three
-cohorts, so a user who picked "critical only" and one who picked "all breaking
-news" receive exactly the same pushes. Priority starts to differentiate only at
-`BROADCAST_PUSH_MIN_LEVEL=high`.
+This table is the only thing that decides who hears about a story.
+`BROADCAST_PUSH_MIN_LEVEL` defaults to `high` — the loosest level the hook
+emits — so the global floor is inert and never overrides the user's choice. It
+defaulted to `critical` during rollout and that brake silently voided the
+Settings copy: a `high` story was dropped before this table ran, so "All
+breaking news updates" and "Only critical events" delivered identical
+notifications. Volume belongs in the min-gap and hourly cap, which drop events
+without reinterpreting preferences.
 
 The `medium` row is currently unreachable: both hook call sites in
 `ais-relay.cjs` fire on `critical | high` only, inheriting the gate the queue
@@ -79,7 +82,8 @@ Redis **suppresses** the push.
 1. **Arming** — off unless `BROADCAST_PUSH_ENABLED=1`.
 2. **Dry-run** — on unless `BROADCAST_PUSH_DRY_RUN=0`. Vercel matches the
    audience and returns the count without sending.
-3. **Level floor** — `BROADCAST_PUSH_MIN_LEVEL`, default `critical`.
+3. **Variant** — only `BROADCAST_PUSH_VARIANTS` (default `full`); each variant is classified against its own feeds.
+4. **Level floor** — `BROADCAST_PUSH_MIN_LEVEL`, default `high`, i.e. inert.
 4. **Source tier + recency** — same gates as the Live Activity hook.
 5. **Dedup** — SHA-256 of the case- and punctuation-folded headline, 6h TTL.
    The level is not in the key, so a re-classification cannot earn a second push.
@@ -120,6 +124,7 @@ To stop immediately, unset `BROADCAST_PUSH_ENABLED` and redeploy — or set
 | `BROADCAST_PUSH_DRY_RUN` | Railway `ais-relay` | **on** | only the literal `0` sends |
 | `PUSH_ADMIN_SECRET` | Railway **and** Vercel | — | must match on both sides |
 | `BROADCAST_PUSH_BASE_URL` | Railway | `https://world-monitor-app.vercel.app` | must match `AppConfig.landingBaseURL` |
+| `BROADCAST_PUSH_VARIANTS` | Railway | `full` | comma list; the relay classifies each variant against its OWN feeds, so anything else is that variant's news, not everyone's |
 | `BROADCAST_PUSH_MIN_LEVEL` | Railway | `high` (inert) | raise to `critical` only as a temporary brake — it overrides the user's own Settings choice while set |
 | `BROADCAST_PUSH_MIN_GAP_S` | Railway | `900` | |
 | `BROADCAST_PUSH_HOURLY_CAP` | Railway | `4` | |
