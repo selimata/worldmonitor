@@ -379,7 +379,7 @@ describe('payload', () => {
   it('sends the source as the subtitle and the headline as the body', () => {
     assert.equal(body.alert.body, CRITICAL.title);
     assert.equal(body.alert.subtitle, 'Reuters');
-    assert.equal(body.alert.title, 'World Alert');
+    assert.equal(body.alert.title.en, 'WORLD ALERT');
   });
 
   it('omits the subtitle when the source is unknown', async () => {
@@ -774,5 +774,43 @@ describe('one loud surface per critical', () => {
   it('high stories keep their banner without touching the activity path', () => {
     const fn = aisRelaySrc.slice(aisRelaySrc.indexOf('function observeCriticalSurfaces'));
     assert.match(fn.slice(0, 500), /if \(level !== 'critical'\) \{\s*\n\s*broadcastPushObserve/);
+  });
+});
+
+describe('localized banner titles', () => {
+  const { TITLE_MAP_BY_LEVEL } = require('../scripts/lib/broadcast-push.cjs');
+
+  it('sends a per-language title map, resolved server-side (no APNs loc-key)', async () => {
+    const { dispatcher, fetchImpl } = makeDispatcher();
+    await dispatcher.observe(CRITICAL);
+    const { title } = fetchImpl.calls[0].body.alert;
+    assert.equal(typeof title, 'object');
+    assert.equal(title.tr, 'KÜRESEL UYARI');
+    assert.equal(title.en, 'WORLD ALERT');
+  });
+
+  it('high uses the catalog Breaking News strings', async () => {
+    const { dispatcher, fetchImpl } = makeDispatcher();
+    await dispatcher.observe({ ...CRITICAL, level: 'high' });
+    assert.equal(fetchImpl.calls[0].body.alert.title.tr, 'Son Dakika');
+  });
+
+  it('every level map ships en and only base language codes', () => {
+    for (const [level, map] of Object.entries(TITLE_MAP_BY_LEVEL)) {
+      assert.ok(map.en, `${level} missing en fallback`);
+      for (const lang of Object.keys(map)) {
+        assert.doesNotMatch(lang, /[-_]/, `${level}.${lang}: devices send languageCode only`);
+      }
+    }
+  });
+
+  it('titles match the app catalog verbatim', () => {
+    const { readFileSync } = require('node:fs');
+    let cat;
+    try {
+      cat = JSON.parse(readFileSync(resolve(__dirname, '..', '..', 'WorldView', 'WorldMonitor', 'Localizable.xcstrings'), 'utf-8'));
+    } catch { return; }
+    const tr = cat.strings['Breaking News']?.localizations?.tr?.stringUnit?.value;
+    if (tr) assert.equal(TITLE_MAP_BY_LEVEL.high.tr, tr, 'drifted from the String Catalog');
   });
 });
