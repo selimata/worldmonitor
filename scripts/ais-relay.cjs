@@ -4152,7 +4152,7 @@ async function seedClassifyForVariant(variant, seenTitles) {
     // Cached critical hits keep the running Live Activity fed (report-count
     // growth → update, still-observed → not stale); starts stay restart-safe
     // via the dispatcher's Redis dedupe + publish-recency window.
-    if (level === 'critical') liveActivityObserve(titleArr[i], allTitles.get(titleArr[i]));
+    if (level === 'critical') liveActivityObserve(titleArr[i], allTitles.get(titleArr[i]), variant);
     // Cached hits reach the broadcast hook too: a story first seen as `high`
     // and re-served from cache must still be able to push once. The
     // dispatcher's Redis dedup makes the repeat visits free.
@@ -4252,7 +4252,7 @@ async function seedClassifyForVariant(variant, seenTitles) {
           severity: level,
           variant,
         }).catch(e => console.warn('[Notify] Classify publish error:', e?.message));
-        if (level === 'critical') liveActivityObserve(chunk[idx], meta);
+        if (level === 'critical') liveActivityObserve(chunk[idx], meta, variant);
         // Same gate as the queue publish above, so a broadcast can never reach
         // a device for a story the PRO relay itself refused to fan out.
         broadcastPushObserve(chunk[idx], meta, level, variant);
@@ -4456,8 +4456,20 @@ async function liveActivityTranslate(title, langs) {
   return have;
 }
 
-function liveActivityObserve(title, meta) {
+/**
+ * Same variant scoping as the broadcast hook, for the same reason: each variant
+ * is classified against its OWN feed set, so finance's "critical" is a rates
+ * or crypto headline — which is how "Mortgage and refinance interest rates
+ * today" got started as a World Alert Live Activity on 137 devices. The card
+ * says WORLD ALERT; only the world variant may start it.
+ */
+const LIVE_ACTIVITY_VARIANTS = new Set(
+  (process.env.LIVE_ACTIVITY_VARIANTS || 'full').split(',').map((v) => v.trim()).filter(Boolean),
+);
+
+function liveActivityObserve(title, meta, variant) {
   if (!liveActivityDispatcher || !title) return;
+  if (!LIVE_ACTIVITY_VARIANTS.has(variant)) return;
   try {
     const source = meta?.source ?? '';
     if (shouldDropRelaySourceForTier(RELAY_GATES_READY, source, RELAY_TIER4_SOURCES)) return;

@@ -445,3 +445,17 @@ describe('relay freshness gate reads the seed envelope', () => {
     assert.match(fn.slice(0, 1100), /Date\.parse\(payload\?\.generatedAt/);
   });
 });
+
+describe('live activity variant scoping', () => {
+  const relaySrc2 = readFileSync(resolve(__dirname, '..', 'scripts', 'ais-relay.cjs'), 'utf-8');
+
+  it('only the world variant may start a World Alert activity', () => {
+    assert.match(relaySrc2, /LIVE_ACTIVITY_VARIANTS = new Set\(\s*\n?\s*\(process\.env\.LIVE_ACTIVITY_VARIANTS \|\| 'full'\)/);
+    assert.match(relaySrc2, /if \(!LIVE_ACTIVITY_VARIANTS\.has\(variant\)\) return;/);
+  });
+
+  it('threads the variant through both critical call sites', () => {
+    assert.match(relaySrc2, /liveActivityObserve\(titleArr\[i\], allTitles\.get\(titleArr\[i\]\), variant\);/);
+    assert.match(relaySrc2, /liveActivityObserve\(chunk\[idx\], meta, variant\);/);
+  });
+});
