@@ -153,7 +153,17 @@ function buildContentState({ title, source, location, reports, updatedAt, link }
   };
 }
 
-function buildStartPayload({ alertId, startedAt, contentState, nowSeconds = Math.floor(Date.now() / 1000) }) {
+/**
+ * The start's own alert banner is OFF by default (LIVE_ACTIVITY_START_ALERT=1
+ * restores it). A critical story also goes out as a broadcast banner within the
+ * same classify pass, so with both loud the user got two banners plus the
+ * activity for one event. The activity still appears on the lock screen and
+ * Dynamic Island without the alert dict — the broadcast banner is the single
+ * loud announcement, this card is the quiet live tracker.
+ */
+const START_ALERT_ENABLED = process.env.LIVE_ACTIVITY_START_ALERT === '1';
+
+function buildStartPayload({ alertId, startedAt, contentState, nowSeconds = Math.floor(Date.now() / 1000), withAlert = START_ALERT_ENABLED }) {
   return {
     aps: {
       timestamp: nowSeconds,
@@ -161,7 +171,7 @@ function buildStartPayload({ alertId, startedAt, contentState, nowSeconds = Math
       'content-state': contentState,
       'attributes-type': ATTRIBUTES_TYPE,
       attributes: { alertId: String(alertId), startedAt: toUnixSeconds(startedAt, nowSeconds * 1000) },
-      alert: { title: START_ALERT_TITLE, body: contentState.title },
+      ...(withAlert ? { alert: { title: START_ALERT_TITLE, body: contentState.title } } : {}),
     },
   };
 }

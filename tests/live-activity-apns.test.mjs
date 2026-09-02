@@ -140,9 +140,18 @@ describe('payload builders', () => {
         'content-state': CONTENT_STATE,
         'attributes-type': 'WorldAlertAttributes',
         attributes: { alertId: 'abc123', startedAt: 1_800_000_000 },
-        alert: { title: 'World Alert', body: 'Iran closes Strait of Hormuz' },
       },
     });
+  });
+
+  it('omits the start alert by default — the broadcast banner is the loud surface', () => {
+    const payload = apns.buildStartPayload({ alertId: 'q', startedAt: 1_800_000_000, contentState: CONTENT_STATE, nowSeconds: 1 });
+    assert.equal('alert' in payload.aps, false, 'a loud start doubles the banner the broadcast already sends');
+  });
+
+  it('restores the start alert when explicitly asked (LIVE_ACTIVITY_START_ALERT=1 path)', () => {
+    const payload = apns.buildStartPayload({ alertId: 'q', startedAt: 1_800_000_000, contentState: CONTENT_STATE, nowSeconds: 1, withAlert: true });
+    assert.deepEqual(payload.aps.alert, { title: 'World Alert', body: 'Iran closes Strait of Hormuz' });
   });
 
   it('start payload converts a millisecond startedAt to unix seconds', () => {
