@@ -458,10 +458,10 @@ describe('ais-relay wiring (source assertions)', () => {
   it('observes CRITICAL alerts from both the LLM branch and cached hits, after the notification publish', () => {
     const branchStart = relaySrc.indexOf("if (level === 'critical' || level === 'high')");
     const publishAt = relaySrc.indexOf('[Notify] Classify publish error', branchStart);
-    const llmHook = relaySrc.indexOf("if (level === 'critical') liveActivityObserve(chunk[idx], meta, variant);", publishAt);
+    const llmHook = relaySrc.indexOf('observeCriticalSurfaces(chunk[idx], meta, level, variant);', publishAt);
     assert.ok(branchStart !== -1 && publishAt !== -1, 'classify critical/high branch not found');
-    assert.ok(llmHook !== -1 && llmHook - publishAt < 200, 'LLM-branch hook must follow the notification publish inside the same block');
-    assert.match(relaySrc, /if \(level === 'critical'\) liveActivityObserve\(titleArr\[i\], allTitles\.get\(titleArr\[i\]\), variant\);/);
+    assert.ok(llmHook !== -1 && llmHook - publishAt < 400, 'LLM-branch hook must follow the notification publish inside the same block');
+    assert.match(relaySrc, /observeCriticalSurfaces\(titleArr\[i\], allTitles\.get\(titleArr\[i\]\), level, variant\);/);
   });
 
   it('gates observations on the same source-tier policy as notifications', () => {

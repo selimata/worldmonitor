@@ -746,17 +746,33 @@ describe('variant scoping', () => {
     // Nested parens in the arguments defeat a regex, so match the exact lines.
     assert.match(
       relaySrc,
-      /broadcastPushObserve\(titleArr\[i\], allTitles\.get\(titleArr\[i\]\), level, variant\);/,
-      'cached-classification path must pass its variant',
+      /observeCriticalSurfaces\(titleArr\[i\], allTitles\.get\(titleArr\[i\]\), level, variant\);/,
+      'cached-classification path must route through the coordinator',
     );
     assert.match(
       relaySrc,
-      /broadcastPushObserve\(chunk\[idx\], meta, level, variant\);/,
-      'freshly-classified path must pass its variant',
+      /observeCriticalSurfaces\(chunk\[idx\], meta, level, variant\);/,
+      'freshly-classified path must route through the coordinator',
     );
-    assert.equal(
-      (relaySrc.match(/broadcastPushObserve\(/g) ?? []).length, 3,
-      'one declaration plus exactly two call sites — a third would bypass the variant guard',
-    );
+    // 1 declaration + 4 coordinator-internal calls; classify paths call the
+    // coordinator, never broadcastPushObserve directly.
+    const direct = (relaySrc.match(/broadcastPushObserve\(titleArr|broadcastPushObserve\(chunk/g) ?? []).length;
+    assert.equal(direct, 0, 'classify paths must not bypass observeCriticalSurfaces');
+  });
+});
+
+describe('one loud surface per critical', () => {
+  it('cedes the banner when the activity owns the story, fires it when held', () => {
+    const fn = aisRelaySrc.slice(aisRelaySrc.indexOf('function observeCriticalSurfaces'));
+    assert.match(fn.slice(0, 1400), /action === 'started'/);
+    assert.match(fn.slice(0, 1400), /action === 'updated'/);
+    assert.match(aisRelaySrc, /LA_CEDE_NOOP_REASONS = new Set\(\['already-started', 'no-new-reports'\]\)/);
+    assert.match(fn.slice(0, 1400), /ceded to live activity/);
+    assert.match(fn.slice(0, 1400), /\.catch\(\(\) => broadcastPushObserve/, 'an LA failure must not swallow the banner');
+  });
+
+  it('high stories keep their banner without touching the activity path', () => {
+    const fn = aisRelaySrc.slice(aisRelaySrc.indexOf('function observeCriticalSurfaces'));
+    assert.match(fn.slice(0, 500), /if \(level !== 'critical'\) \{\s*\n\s*broadcastPushObserve/);
   });
 });

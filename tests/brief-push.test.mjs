@@ -451,11 +451,11 @@ describe('live activity variant scoping', () => {
 
   it('only the world variant may start a World Alert activity', () => {
     assert.match(relaySrc2, /LIVE_ACTIVITY_VARIANTS = new Set\(\s*\n?\s*\(process\.env\.LIVE_ACTIVITY_VARIANTS \|\| 'full'\)/);
-    assert.match(relaySrc2, /if \(!LIVE_ACTIVITY_VARIANTS\.has\(variant\)\) return;/);
+    assert.match(relaySrc2, /if \(!LIVE_ACTIVITY_VARIANTS\.has\(variant\)\) return null;/);
   });
 
   it('threads the variant through both critical call sites', () => {
-    assert.match(relaySrc2, /liveActivityObserve\(titleArr\[i\], allTitles\.get\(titleArr\[i\]\), variant\);/);
-    assert.match(relaySrc2, /liveActivityObserve\(chunk\[idx\], meta, variant\);/);
+    assert.match(relaySrc2, /observeCriticalSurfaces\(titleArr\[i\], allTitles\.get\(titleArr\[i\]\), level, variant\);/);
+    assert.match(relaySrc2, /observeCriticalSurfaces\(chunk\[idx\], meta, level, variant\);/);
   });
 });

@@ -4152,12 +4152,11 @@ async function seedClassifyForVariant(variant, seenTitles) {
     // Cached critical hits keep the running Live Activity fed (report-count
     // growth → update, still-observed → not stale); starts stay restart-safe
     // via the dispatcher's Redis dedupe + publish-recency window.
-    if (level === 'critical') liveActivityObserve(titleArr[i], allTitles.get(titleArr[i]), variant);
-    // Cached hits reach the broadcast hook too: a story first seen as `high`
-    // and re-served from cache must still be able to push once. The
-    // dispatcher's Redis dedup makes the repeat visits free.
+    // Cached hits reach both surfaces too: a story first seen as `high` and
+    // re-served from cache must still be able to push once. Redis dedup on
+    // both sides makes the repeat visits free.
     if (level === 'critical' || level === 'high') {
-      broadcastPushObserve(titleArr[i], allTitles.get(titleArr[i]), level, variant);
+      observeCriticalSurfaces(titleArr[i], allTitles.get(titleArr[i]), level, variant);
     }
     for (const code of matchCountryNamesInText(titleArr[i])) {
       if (!byCountry[code]) byCountry[code] = emptyLevel();
@@ -4252,10 +4251,9 @@ async function seedClassifyForVariant(variant, seenTitles) {
           severity: level,
           variant,
         }).catch(e => console.warn('[Notify] Classify publish error:', e?.message));
-        if (level === 'critical') liveActivityObserve(chunk[idx], meta, variant);
-        // Same gate as the queue publish above, so a broadcast can never reach
-        // a device for a story the PRO relay itself refused to fan out.
-        broadcastPushObserve(chunk[idx], meta, level, variant);
+        // Same gate as the queue publish above; for criticals the activity
+        // outcome decides whether the banner also fires (one loud surface).
+        observeCriticalSurfaces(chunk[idx], meta, level, variant);
       }
     }
 
@@ -4467,23 +4465,66 @@ const LIVE_ACTIVITY_VARIANTS = new Set(
   (process.env.LIVE_ACTIVITY_VARIANTS || 'full').split(',').map((v) => v.trim()).filter(Boolean),
 );
 
+/** @returns {Promise<{action:string,reason?:string}>|null} the dispatcher's decision, so the broadcast can cede to a start; null when the hook did not run. */
 function liveActivityObserve(title, meta, variant) {
-  if (!liveActivityDispatcher || !title) return;
-  if (!LIVE_ACTIVITY_VARIANTS.has(variant)) return;
+  if (!liveActivityDispatcher || !title) return null;
+  if (!LIVE_ACTIVITY_VARIANTS.has(variant)) return null;
   try {
     const source = meta?.source ?? '';
-    if (shouldDropRelaySourceForTier(RELAY_GATES_READY, source, RELAY_TIER4_SOURCES)) return;
-    liveActivityDispatcher.observeCriticalAlert({
+    if (shouldDropRelaySourceForTier(RELAY_GATES_READY, source, RELAY_TIER4_SOURCES)) return null;
+    return liveActivityDispatcher.observeCriticalAlert({
       title,
       link: meta?.link ?? '',
       source,
       location: liveActivityLocationForTitle(title),
       reports: meta?.corroborationCount ?? 1,
       publishedAt: meta?.publishedAt,
-    }).catch((e) => console.warn('[LiveActivity] observe failed:', e?.message || e));
+    }).catch((e) => { console.warn('[LiveActivity] observe failed:', e?.message || e); return null; });
   } catch (e) {
     console.warn('[LiveActivity] observe failed:', e?.message || e);
+    return null;
   }
+}
+
+/**
+ * One loud surface per critical story.
+ *
+ * The Live Activity start carries its own alert (silent starts turned out not
+ * to render — LIVE_ACTIVITY_START_ALERT history), so a critical that STARTS an
+ * activity is already announced with the same headline; sending the broadcast
+ * banner too put two near-identical alerts on the lock screen in the same
+ * second. The activity outcome decides:
+ *
+ *   started / updated / same-alert noops -> the card owns this story, cede
+ *   held (cooldown, another activity active) or any failure -> banner fires,
+ *     so a story the card machinery declines is still announced exactly once
+ *
+ * `high` stories never reach the activity path and keep their banner.
+ */
+const LA_CEDE_NOOP_REASONS = new Set(['already-started', 'no-new-reports']);
+
+function observeCriticalSurfaces(title, meta, level, variant) {
+  if (level !== 'critical') {
+    broadcastPushObserve(title, meta, level, variant);
+    return;
+  }
+  const la = liveActivityObserve(title, meta, variant);
+  if (!la) {
+    broadcastPushObserve(title, meta, level, variant);
+    return;
+  }
+  la.then((r) => {
+    const ceded = r && (
+      r.action === 'started' ||
+      r.action === 'updated' ||
+      (r.action === 'noop' && LA_CEDE_NOOP_REASONS.has(r.reason))
+    );
+    if (ceded) {
+      console.log(`[BroadcastPush] ceded to live activity (${r.action}${r.reason ? ':' + r.reason : ''}): ${String(title).slice(0, 80)}`);
+      return;
+    }
+    broadcastPushObserve(title, meta, level, variant);
+  }).catch(() => broadcastPushObserve(title, meta, level, variant));
 }
 
 // ─────────────────────────────────────────────────────────────
