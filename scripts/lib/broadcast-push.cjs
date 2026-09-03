@@ -400,8 +400,21 @@ function createBroadcastPushDispatcher({ env, redis, translate, fetchImpl, log =
   async function localizedBody(headline) {
     if (!i18n || !translate || langs.length === 0) return headline;
     try {
-      const translated = await translate(headline, langs);
-      if (!translated || typeof translated !== 'object') return headline;
+      // The translator shares provider quotas with the classify sweep that just
+      // produced this headline, so "every provider declined" is usually a burst
+      // of contention, not an outage — one short-delay retry rides it out.
+      // Observed 2026-09-03: an all-provider miss shipped a raw English body
+      // with nothing in the logs.
+      let translated = await translate(headline, langs);
+      const usable = (t) => t && typeof t === 'object' && langs.some((l) => typeof t[l] === 'string' && t[l].trim());
+      if (!usable(translated)) {
+        await new Promise((r) => setTimeout(r, 3000));
+        translated = await translate(headline, langs);
+      }
+      if (!usable(translated)) {
+        log.warn?.(`[BroadcastPush] i18n returned no languages after retry, sending source text: ${headline.slice(0, 60)}`);
+        return headline;
+      }
       // `en` must exist: pick() in pages/api/push/send.ts falls back to it when
       // a device's language is not in the map.
       const map = { en: headline };

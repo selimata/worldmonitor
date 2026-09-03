@@ -885,3 +885,30 @@ describe('daily cap', () => {
     assert.ok(redis.deleted.some((k) => k.includes(':daycap:')), 'a failed send must not burn a daily slot');
   });
 });
+
+describe('i18n resilience', () => {
+  it('retries once when every provider declined, then uses the second answer', async () => {
+    let calls = 0;
+    const translate = async () => (++calls === 1 ? {} : { tr: 'Çeviri geldi' });
+    const { dispatcher, fetchImpl } = makeDispatcher(
+      { BROADCAST_PUSH_I18N: '1', BROADCAST_PUSH_LANGS: 'tr' }, { translate });
+    await dispatcher.observe(CRITICAL);
+    assert.equal(calls, 2);
+    assert.equal(fetchImpl.calls[0].body.alert.body.tr, 'Çeviri geldi');
+  });
+
+  it('falls back to source text with a WARNING when the retry also comes back empty', async () => {
+    const warns = [];
+    const redis = fakeRedis();
+    const dispatcher = createBroadcastPushDispatcher({
+      env: { ...BASE_ENV, BROADCAST_PUSH_I18N: '1', BROADCAST_PUSH_LANGS: 'tr' },
+      redis, fetchImpl: fakeFetch(),
+      log: { log: () => {}, warn: (m) => warns.push(m) },
+      now: () => 1_800_000_000_000,
+      translate: async () => ({}),
+    });
+    const r = await dispatcher.observe(CRITICAL);
+    assert.equal(r.action, 'sent', 'delivery still beats dropping');
+    assert.ok(warns.some((w) => w.includes('i18n returned no languages')), 'the miss must not be silent');
+  });
+});
