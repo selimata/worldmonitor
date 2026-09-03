@@ -50,8 +50,9 @@ Inverting that gives the table in `scripts/lib/broadcast-push.cjs`:
 
 | Event level | Device cohorts notified |
 |---|---|
-| `critical` | `high`, `medium`, `low` (everyone) |
-| `high` | `medium`, `low` |
+| `critical` | `high`, `medium`, `low` (everyone) — single-source allowed |
+| `high`, ≥2 sources | `medium`, `low` |
+| `high`, single-source | `low` only — source confidence maps onto user tolerance: "All breaking news updates" is precisely a request for the unconfirmed firehose |
 | `medium` | `low` |
 | `low`, `info` | nobody |
 

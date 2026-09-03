@@ -47,7 +47,9 @@
  *   BROADCAST_PUSH_MIN_GAP_S   default 900 (15min between any two broadcasts)
  *   BROADCAST_PUSH_HOURLY_CAP  default 4
  *   BROADCAST_PUSH_DAILY_CAP   default 8
- *   BROADCAST_PUSH_MIN_SOURCES_HIGH  default 2 — high needs corroboration; critical exempt
+ *   BROADCAST_PUSH_MIN_SOURCES_HIGH  default 2 — an uncorroborated high
+ *                              narrows to the `low` cohort instead of sending
+ *                              to medium+low; critical exempt
  *   BROADCAST_PUSH_AUDIENCE_LIMIT devices per page, default 5000
  *   BROADCAST_PUSH_MAX_PAGES   runaway guard on the paging loop, default 20
  *   BROADCAST_PUSH_I18N        "1" to translate the headline per language
@@ -414,8 +416,7 @@ function createBroadcastPushDispatcher({ env, redis, translate, fetchImpl, log =
     }
   }
 
-  function buildBody({ level, headline, body, link, source, hash }) {
-    const audience = audienceForLevel(level);
+  function buildBody({ level, audience, headline, body, link, source, hash }) {
     return {
       audience: {
         priority: [...audience],
@@ -540,13 +541,19 @@ function createBroadcastPushDispatcher({ env, redis, translate, fetchImpl, log =
       const headline = normalizeHeadline(alert?.title);
       if (!headline) return { action: 'skipped', reason: 'empty title' };
 
-      const audience = audienceForLevel(level);
+      let audience = audienceForLevel(level);
       if (audience.length === 0) return { action: 'skipped', reason: `no audience for level ${level}` };
 
+      // Source confidence maps onto user tolerance instead of binning the
+      // story: an uncorroborated `high` reaches ONLY the `low` cohort, whose
+      // Settings wording ("All breaking news updates") is precisely a request
+      // for the unconfirmed firehose. It joins medium once a second outlet
+      // carries it — usually under a different headline, so dedup does not
+      // block the corroborated wave; the min-gap and caps bound the near-dupe
+      // the low cohort may see from that.
       const sources = Math.max(1, Number(alert?.sources) || 1);
-      if (level === 'high' && sources < minSourcesHigh) {
-        return { action: 'skipped', reason: `single-source high (${sources}/${minSourcesHigh})` };
-      }
+      const uncorroborated = level === 'high' && sources < minSourcesHigh;
+      if (uncorroborated) audience = ['low'];
 
       // Guard order is deliberate and cheapest-first: a duplicate must not burn
       // the min-gap window or an hourly slot that a genuinely new story needs.
@@ -580,6 +587,7 @@ function createBroadcastPushDispatcher({ env, redis, translate, fetchImpl, log =
       const body = await localizedBody(headline);
       const payload = buildBody({
         level,
+        audience,
         headline,
         body,
         link: alert?.link ?? '',

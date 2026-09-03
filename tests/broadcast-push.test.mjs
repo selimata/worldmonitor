@@ -815,28 +815,33 @@ describe('localized banner titles', () => {
   });
 });
 
-describe('corroboration gate for high', () => {
-  it('skips a single-source high — one outlet carrying a story is that outlet\'s story', async () => {
+describe('corroboration maps onto user tolerance', () => {
+  it('an uncorroborated high reaches ONLY the low cohort — they asked for the firehose', async () => {
     const { dispatcher, fetchImpl } = makeDispatcher();
     const r = await dispatcher.observe({ ...CRITICAL, level: 'high', sources: 1 });
-    assert.equal(r.action, 'skipped');
-    assert.match(r.reason, /single-source high/);
-    assert.equal(fetchImpl.calls.length, 0);
+    assert.equal(r.action, 'sent');
+    assert.deepEqual(r.audience, ['low']);
+    const { audience } = fetchImpl.calls[0].body;
+    assert.deepEqual(audience.priority, ['low']);
+    assert.equal(audience.includeUnsetPriority, false, 'unset means the medium default, which did not ask for unconfirmed news');
   });
 
-  it('sends a corroborated high', async () => {
-    const { dispatcher } = makeDispatcher();
+  it('a corroborated high reaches medium + low', async () => {
+    const { dispatcher, fetchImpl } = makeDispatcher();
     assert.equal((await dispatcher.observe({ ...CRITICAL, level: 'high', sources: 2 })).action, 'sent');
+    assert.deepEqual(fetchImpl.calls[0].body.audience.priority, ['medium', 'low']);
   });
 
-  it('critical is exempt — a war headline\'s first minutes are single-source', async () => {
-    const { dispatcher } = makeDispatcher();
+  it('critical is exempt — single-source critical still reaches everyone', async () => {
+    const { dispatcher, fetchImpl } = makeDispatcher();
     assert.equal((await dispatcher.observe({ ...CRITICAL, sources: 1 })).action, 'sent');
+    assert.deepEqual(fetchImpl.calls[0].body.audience.priority, ['high', 'medium', 'low']);
   });
 
-  it('missing sources counts as 1, not as a free pass', async () => {
-    const { dispatcher } = makeDispatcher();
-    assert.equal((await dispatcher.observe({ ...CRITICAL, level: 'high' })).action, 'skipped');
+  it('missing sources counts as 1, not as a free pass to medium', async () => {
+    const { dispatcher, fetchImpl } = makeDispatcher();
+    await dispatcher.observe({ ...CRITICAL, level: 'high' });
+    assert.deepEqual(fetchImpl.calls[0].body.audience.priority, ['low']);
   });
 });
 
