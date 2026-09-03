@@ -230,14 +230,14 @@ describe('BROADCAST_PUSH_MIN_LEVEL', () => {
     // The relay hook only ever emits critical|high, so a default of `high`
     // means this global floor never overrides AUDIENCE_BY_LEVEL.
     const { dispatcher, fetchImpl } = makeDispatcher({ BROADCAST_PUSH_MIN_LEVEL: undefined });
-    assert.equal((await dispatcher.observe({ ...CRITICAL, level: 'high' })).action, 'sent');
+    assert.equal((await dispatcher.observe({ ...CRITICAL, level: 'high', sources: 2 })).action, 'sent');
     assert.deepEqual(fetchImpl.calls[0].body.audience.priority, ['medium', 'low'],
       'a high story reaches everyone EXCEPT the critical-only cohort');
   });
 
   it('an unrecognised value falls back to the inert default, not to a brake', async () => {
     const { dispatcher } = makeDispatcher({ BROADCAST_PUSH_MIN_LEVEL: 'everything' });
-    assert.equal((await dispatcher.observe({ ...CRITICAL, level: 'high' })).action, 'sent');
+    assert.equal((await dispatcher.observe({ ...CRITICAL, level: 'high', sources: 2 })).action, 'sent');
   });
 
   it('can still be raised to critical as a deliberate temporary brake', async () => {
@@ -554,7 +554,7 @@ describe('failure handling', () => {
     );
     const r = await dispatcher.observe(CRITICAL);
     assert.equal(r.action, 'error');
-    assert.equal(redis.deleted.length, 3, 'dedup + gap + cap slot must all be released');
+    assert.equal(redis.deleted.length, 4, 'dedup + gap + hourly and daily slots must all be released');
     assert.ok(redis.deleted.some((k) => k.includes(':seen:')));
     assert.ok(redis.deleted.some((k) => k.endsWith(':gap')));
     assert.ok(redis.deleted.some((k) => k.includes(':cap:')));
@@ -791,7 +791,7 @@ describe('localized banner titles', () => {
 
   it('high uses the catalog Breaking News strings', async () => {
     const { dispatcher, fetchImpl } = makeDispatcher();
-    await dispatcher.observe({ ...CRITICAL, level: 'high' });
+    await dispatcher.observe({ ...CRITICAL, level: 'high', sources: 2 });
     assert.equal(fetchImpl.calls[0].body.alert.title.tr, 'Son Dakika');
   });
 
@@ -812,5 +812,71 @@ describe('localized banner titles', () => {
     } catch { return; }
     const tr = cat.strings['Breaking News']?.localizations?.tr?.stringUnit?.value;
     if (tr) assert.equal(TITLE_MAP_BY_LEVEL.high.tr, tr, 'drifted from the String Catalog');
+  });
+});
+
+describe('corroboration gate for high', () => {
+  it('skips a single-source high — one outlet carrying a story is that outlet\'s story', async () => {
+    const { dispatcher, fetchImpl } = makeDispatcher();
+    const r = await dispatcher.observe({ ...CRITICAL, level: 'high', sources: 1 });
+    assert.equal(r.action, 'skipped');
+    assert.match(r.reason, /single-source high/);
+    assert.equal(fetchImpl.calls.length, 0);
+  });
+
+  it('sends a corroborated high', async () => {
+    const { dispatcher } = makeDispatcher();
+    assert.equal((await dispatcher.observe({ ...CRITICAL, level: 'high', sources: 2 })).action, 'sent');
+  });
+
+  it('critical is exempt — a war headline\'s first minutes are single-source', async () => {
+    const { dispatcher } = makeDispatcher();
+    assert.equal((await dispatcher.observe({ ...CRITICAL, sources: 1 })).action, 'sent');
+  });
+
+  it('missing sources counts as 1, not as a free pass', async () => {
+    const { dispatcher } = makeDispatcher();
+    assert.equal((await dispatcher.observe({ ...CRITICAL, level: 'high' })).action, 'skipped');
+  });
+});
+
+describe('daily cap', () => {
+  it('stops at the configured broadcasts per UTC day, across hours', async () => {
+    let clock = 1_800_000_000_000;
+    const redis = fakeRedis();
+    const { dispatcher, fetchImpl } = makeDispatcher(
+      { BROADCAST_PUSH_MIN_GAP_S: '0', BROADCAST_PUSH_HOURLY_CAP: '10', BROADCAST_PUSH_DAILY_CAP: '2' },
+      { redis, now: () => clock },
+    );
+    assert.equal((await dispatcher.observe({ ...CRITICAL, title: 'S1' })).action, 'sent');
+    clock += 3_600_000; // hourly cap resets, daily must not
+    assert.equal((await dispatcher.observe({ ...CRITICAL, title: 'S2' })).action, 'sent');
+    clock += 3_600_000;
+    const third = await dispatcher.observe({ ...CRITICAL, title: 'S3' });
+    assert.equal(third.action, 'suppressed');
+    assert.match(third.reason, /daily cap/);
+    assert.equal(fetchImpl.calls.length, 2);
+  });
+
+  it('refills on the next UTC day', async () => {
+    let clock = 1_800_000_000_000;
+    const redis = fakeRedis();
+    const { dispatcher } = makeDispatcher(
+      { BROADCAST_PUSH_MIN_GAP_S: '0', BROADCAST_PUSH_HOURLY_CAP: '10', BROADCAST_PUSH_DAILY_CAP: '1' },
+      { redis, now: () => clock },
+    );
+    assert.equal((await dispatcher.observe({ ...CRITICAL, title: 'D1' })).action, 'sent');
+    clock += 86_400_000;
+    assert.equal((await dispatcher.observe({ ...CRITICAL, title: 'D2' })).action, 'sent');
+  });
+
+  it('releases the daily slot too when the transport fails before any page lands', async () => {
+    const redis = fakeRedis();
+    const { dispatcher } = makeDispatcher(
+      { BROADCAST_PUSH_MIN_GAP_S: '900' },
+      { redis, fetchImpl: scriptedFetch([{ throws: new Error('ECONNREFUSED') }]) },
+    );
+    await dispatcher.observe(CRITICAL);
+    assert.ok(redis.deleted.some((k) => k.includes(':daycap:')), 'a failed send must not burn a daily slot');
   });
 });

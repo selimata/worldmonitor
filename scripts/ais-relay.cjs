@@ -4601,6 +4601,7 @@ function broadcastPushObserve(title, meta, level, variant) {
       level,
       link: meta?.link ?? '',
       source,
+      sources: meta?.corroborationCount ?? 1,
       publishedAt,
     }).then((r) => {
       if (r?.action === 'suppressed' || r?.action === 'skipped') {

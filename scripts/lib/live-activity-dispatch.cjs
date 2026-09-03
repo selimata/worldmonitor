@@ -229,23 +229,32 @@ function createLiveActivityDispatcher({
    * all, and any failure falls back to English rather than dropping the push.
    */
   async function statesByToken(record, tokens) {
-    const base = contentStateFor(record);
+    const raw = contentStateFor(record);
     const langByToken = await langsForTokens(tokens);
-    const targets = [...new Set(langByToken.values())].filter((l) => l !== 'en');
+    // 'en' is a translation TARGET like any other. The raw title is whatever
+    // language the source wrote it in — "English on the wire" became a lie the
+    // moment a Hebrew feed item was the story, and every token registered 'en'
+    // (which today is all of them) received raw Hebrew. One call still covers
+    // every language, and an already-English title translates to itself.
+    const targets = [...new Set([...langByToken.values(), 'en'])];
     let titles = {};
-    if (targets.length > 0 && typeof translate === 'function') {
+    if (typeof translate === 'function') {
       try {
-        titles = (await translate(base.title, targets)) || {};
+        titles = (await translate(raw.title, targets)) || {};
       } catch (e) {
         log.warn(`[LiveActivity] translate failed: ${e?.message || e}`);
       }
     }
+    const clamp = (t) => ({ ...raw, title: t.trim().slice(0, TRANSLATED_TITLE_MAX_CHARS) });
+    // The English rendering is also the fallback for a language whose own
+    // translation failed — English-instead-of-Turkish beats Hebrew-instead-of-
+    // Turkish. Raw survives only if even the 'en' translation failed.
+    const base = typeof titles.en === 'string' && titles.en.trim() ? clamp(titles.en) : raw;
     const byLang = new Map([['en', base]]);
     for (const lang of targets) {
+      if (lang === 'en') continue;
       const t = titles[lang];
-      byLang.set(lang, typeof t === 'string' && t.trim()
-        ? { ...base, title: t.trim().slice(0, TRANSLATED_TITLE_MAX_CHARS) }
-        : base);
+      byLang.set(lang, typeof t === 'string' && t.trim() ? clamp(t) : base);
     }
     const out = new Map();
     for (const [token, lang] of langByToken) out.set(token, byLang.get(lang) || base);

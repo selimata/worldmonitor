@@ -484,3 +484,17 @@ describe('ais-relay wiring (source assertions)', () => {
     assert.match(dockerfile, /^COPY scripts\/lib\/live-activity-dispatch\.cjs \.\/scripts\/lib\/live-activity-dispatch\.cjs$/m);
   });
 });
+
+describe('statesByToken never ships the raw source language', () => {
+  const src = readFileSync(new URL('../scripts/lib/live-activity-dispatch.cjs', import.meta.url), 'utf-8');
+
+  it("treats 'en' as a translation target, not as the wire default", () => {
+    assert.match(src, /new Set\(\[\.\.\.langByToken\.values\(\), 'en'\]\)/,
+      "every token registered 'en' (today: all of them) received raw Hebrew when the source was Hebrew");
+  });
+
+  it('falls back failed translations to the English rendering, raw only as last resort', () => {
+    assert.match(src, /const base = typeof titles\.en === 'string' && titles\.en\.trim\(\) \? clamp\(titles\.en\) : raw;/);
+    assert.match(src, /byLang\.set\(lang, typeof t === 'string' && t\.trim\(\) \? clamp\(t\) : base\);/);
+  });
+});

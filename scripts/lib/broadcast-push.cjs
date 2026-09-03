@@ -46,6 +46,8 @@
  *   BROADCAST_PUSH_DEDUP_TTL_S default 21600 (6h)
  *   BROADCAST_PUSH_MIN_GAP_S   default 900 (15min between any two broadcasts)
  *   BROADCAST_PUSH_HOURLY_CAP  default 4
+ *   BROADCAST_PUSH_DAILY_CAP   default 8
+ *   BROADCAST_PUSH_MIN_SOURCES_HIGH  default 2 — high needs corroboration; critical exempt
  *   BROADCAST_PUSH_AUDIENCE_LIMIT devices per page, default 5000
  *   BROADCAST_PUSH_MAX_PAGES   runaway guard on the paging loop, default 20
  *   BROADCAST_PUSH_I18N        "1" to translate the headline per language
@@ -230,6 +232,19 @@ const DEFAULT_HOURLY_CAP = 4;
 const DEFAULT_AUDIENCE_LIMIT = 5_000;
 /** Runaway guard on the paging loop: 20 x 5k = 100k devices. */
 const DEFAULT_MAX_PAGES = 20;
+/**
+ * `high` needs independent corroboration before it may interrupt anyone.
+ * Observed 2026-09-02: a single Ghanaian outlet's FDA consumer-recall story
+ * went out as breaking news. A story one outlet carries is that outlet's
+ * story; two carrying it is an event. `critical` is exempt — a war headline's
+ * first minutes are often single-source and critical is rare by definition.
+ */
+const DEFAULT_MIN_SOURCES_HIGH = 2;
+/** Volume ceiling per UTC day, on top of the hourly cap. */
+const DEFAULT_DAILY_CAP = 8;
+/** A day bucket plus slack. */
+const DAILY_SLOT_TTL_S = 26 * 60 * 60;
+
 /** An hour bucket plus slack, so a slot key always outlives its own bucket. */
 const CAP_SLOT_TTL_S = 3900;
 
@@ -321,6 +336,8 @@ function createBroadcastPushDispatcher({ env, redis, translate, fetchImpl, log =
   const hourlyCap = envInt(env, 'BROADCAST_PUSH_HOURLY_CAP', DEFAULT_HOURLY_CAP, 1);
   const audienceLimit = envInt(env, 'BROADCAST_PUSH_AUDIENCE_LIMIT', DEFAULT_AUDIENCE_LIMIT, 1);
   const maxPages = envInt(env, 'BROADCAST_PUSH_MAX_PAGES', DEFAULT_MAX_PAGES, 1);
+  const minSourcesHigh = envInt(env, 'BROADCAST_PUSH_MIN_SOURCES_HIGH', DEFAULT_MIN_SOURCES_HIGH, 1);
+  const dailyCap = envInt(env, 'BROADCAST_PUSH_DAILY_CAP', DEFAULT_DAILY_CAP, 1);
   const sandbox = String(env.APNS_ENVIRONMENT ?? '').toLowerCase() === 'sandbox';
   const i18n = envFlag(env, 'BROADCAST_PUSH_I18N');
   const langs = String(env.BROADCAST_PUSH_LANGS ?? '')
@@ -332,7 +349,7 @@ function createBroadcastPushDispatcher({ env, redis, translate, fetchImpl, log =
 
   const config = Object.freeze({
     enabled, armed, dryRun, sandbox, i18n, langs,
-    baseUrl, minLevelRank, dedupTtlS, minGapS, hourlyCap, audienceLimit, maxPages,
+    baseUrl, minLevelRank, dedupTtlS, minGapS, hourlyCap, dailyCap, minSourcesHigh, audienceLimit, maxPages,
     hasSecret: !!secret,
   });
 
@@ -349,6 +366,19 @@ function createBroadcastPushDispatcher({ env, redis, translate, fetchImpl, log =
       const key = `${KEY_PREFIX}:cap:${bucket}:${i}`;
       // eslint-disable-next-line no-await-in-loop -- slots must be claimed in order; cap is small
       const result = await redis.setNx(key, '1', CAP_SLOT_TTL_S);
+      if (result === 'new') return key;
+      if (result !== 'duplicate') return null;
+    }
+    return null;
+  }
+
+  /** Same single-use SET NX slot pattern as the hourly cap, per UTC day. */
+  async function claimDailySlot(nowMs) {
+    const day = Math.floor(nowMs / 86_400_000);
+    for (let i = 0; i < dailyCap; i++) {
+      const key = `${KEY_PREFIX}:daycap:${day}:${i}`;
+      // eslint-disable-next-line no-await-in-loop -- slots claimed in order; cap is small
+      const result = await redis.setNx(key, '1', DAILY_SLOT_TTL_S);
       if (result === 'new') return key;
       if (result !== 'duplicate') return null;
     }
@@ -513,6 +543,11 @@ function createBroadcastPushDispatcher({ env, redis, translate, fetchImpl, log =
       const audience = audienceForLevel(level);
       if (audience.length === 0) return { action: 'skipped', reason: `no audience for level ${level}` };
 
+      const sources = Math.max(1, Number(alert?.sources) || 1);
+      if (level === 'high' && sources < minSourcesHigh) {
+        return { action: 'skipped', reason: `single-source high (${sources}/${minSourcesHigh})` };
+      }
+
       // Guard order is deliberate and cheapest-first: a duplicate must not burn
       // the min-gap window or an hourly slot that a genuinely new story needs.
       const hash = dedupHash(alert?.title);
@@ -537,6 +572,10 @@ function createBroadcastPushDispatcher({ env, redis, translate, fetchImpl, log =
       const slotKey = await claimHourlySlot(hourBucket(now()));
       if (!slotKey) return { action: 'suppressed', reason: 'hourly cap reached' };
       claimed.push(slotKey);
+
+      const daySlot = await claimDailySlot(now());
+      if (!daySlot) return { action: 'suppressed', reason: 'daily cap reached' };
+      claimed.push(daySlot);
 
       const body = await localizedBody(headline);
       const payload = buildBody({
