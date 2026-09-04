@@ -356,35 +356,55 @@ function createBroadcastPushDispatcher({ env, redis, translate, fetchImpl, log =
   });
 
   /**
-   * Rate limit as N single-use slots per wall-clock hour, claimed with SET NX.
+   * Claim one single-use slot out of `cap` under `keyBase`.
+   *
    * A counter would need INCR plus a separate EXPIRE — two round trips with a
    * window where a crash leaves an immortal counter. Claiming the first free
    * slot key is atomic per attempt and self-expiring, at the cost of at most
-   * `hourlyCap` round trips. `error`/`disabled` are treated as taken: an
-   * unreachable Redis must not unlock the firehose.
+   * `cap` round trips. `error`/`disabled` count as taken: an unreachable Redis
+   * must not unlock the firehose.
    */
-  async function claimHourlySlot(bucket) {
-    for (let i = 0; i < hourlyCap; i++) {
-      const key = `${KEY_PREFIX}:cap:${bucket}:${i}`;
+  async function claimSlot(keyBase, cap, ttlSeconds) {
+    for (let i = 0; i < cap; i++) {
+      const key = `${keyBase}:${i}`;
       // eslint-disable-next-line no-await-in-loop -- slots must be claimed in order; cap is small
-      const result = await redis.setNx(key, '1', CAP_SLOT_TTL_S);
+      const result = await redis.setNx(key, '1', ttlSeconds);
       if (result === 'new') return key;
       if (result !== 'duplicate') return null;
     }
     return null;
   }
 
-  /** Same single-use SET NX slot pattern as the hourly cap, per UTC day. */
-  async function claimDailySlot(nowMs) {
-    const day = Math.floor(nowMs / 86_400_000);
-    for (let i = 0; i < dailyCap; i++) {
-      const key = `${KEY_PREFIX}:daycap:${day}:${i}`;
-      // eslint-disable-next-line no-await-in-loop -- slots claimed in order; cap is small
-      const result = await redis.setNx(key, '1', DAILY_SLOT_TTL_S);
-      if (result === 'new') return key;
-      if (result !== 'duplicate') return null;
+  /**
+   * Budgets are PER COHORT, because notification fatigue is per reader.
+   *
+   * A global budget let one cohort starve the others: on 2026-09-04 eight
+   * overnight single-source stories going to the 13-device `low` cohort
+   * consumed the whole day's quota by 06:00 UTC, so a critical story breaking
+   * later could not have reached the 200+ devices in `high`/`medium` at all.
+   * A send now claims a slot in each cohort it actually addresses — a
+   * `low`-only story spends only `low`'s budget.
+   *
+   * All-or-nothing: a partial claim is released before returning, so a story
+   * blocked on its last cohort leaves no slot consumed anywhere.
+   *
+   * @returns {Promise<string[]|null>} claimed keys, or null with the cohort
+   *   that was full recorded in `fullCohort`.
+   */
+  let fullCohort = null;
+  async function claimCohortSlots(namespace, bucket, cap, cohorts, ttlSeconds) {
+    const keys = [];
+    for (const cohort of cohorts) {
+      // eslint-disable-next-line no-await-in-loop -- at most three cohorts
+      const key = await claimSlot(`${KEY_PREFIX}:${namespace}:${cohort}:${bucket}`, cap, ttlSeconds);
+      if (!key) {
+        fullCohort = cohort;
+        await release(keys);
+        return null;
+      }
+      keys.push(key);
     }
-    return null;
+    return keys;
   }
 
   /** Best-effort unwind; a failure here only costs one suppressed broadcast. */
@@ -612,13 +632,13 @@ function createBroadcastPushDispatcher({ env, redis, translate, fetchImpl, log =
         claimed.push(gapKey);
       }
 
-      const slotKey = await claimHourlySlot(hourBucket(now()));
-      if (!slotKey) return deferAndRelease('hourly cap reached');
-      claimed.push(slotKey);
+      const hourSlots = await claimCohortSlots('cap', hourBucket(now()), hourlyCap, audience, CAP_SLOT_TTL_S);
+      if (!hourSlots) return deferAndRelease(`hourly cap reached (${fullCohort})`);
+      claimed.push(...hourSlots);
 
-      const daySlot = await claimDailySlot(now());
-      if (!daySlot) return deferAndRelease('daily cap reached');
-      claimed.push(daySlot);
+      const daySlots = await claimCohortSlots('daycap', Math.floor(now() / 86_400_000), dailyCap, audience, DAILY_SLOT_TTL_S);
+      if (!daySlots) return deferAndRelease(`daily cap reached (${fullCohort})`);
+      claimed.push(...daySlots);
 
       const body = await localizedBody(headline);
       const payload = buildBody({

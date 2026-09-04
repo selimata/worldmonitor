@@ -89,8 +89,19 @@ Redis **suppresses** the push.
 5. **Dedup** — SHA-256 of the case- and punctuation-folded headline, 6h TTL.
    The level is not in the key, so a re-classification cannot earn a second push.
 6. **Min gap** — 15 min between any two broadcasts, whatever the story.
-7. **Hourly cap** — 4 per wall-clock hour, claimed as single-use `SET NX` slot
-   keys (atomic and self-expiring; a counter would need a separate `EXPIRE`).
+7. **Hourly and daily caps** — claimed as single-use `SET NX` slot keys
+   (atomic and self-expiring; a counter would need a separate `EXPIRE`), and
+   budgeted **per cohort**, because fatigue is per reader. A global budget let
+   one cohort starve the others: on 2026-09-04 eight overnight single-source
+   stories to the 13-device `low` cohort spent the whole day's quota by 06:00
+   UTC, so a critical breaking later could not have reached the 200+ devices in
+   `high`/`medium`. A partial claim is released before returning, so a story
+   blocked on its last cohort consumes nothing anywhere.
+
+Every rate-limited exit RELEASES what it claimed, including the dedup key: a
+limiter must defer a story, not consume it. The sweep re-observes the same
+headline every 15min, so a deferred story is reconsidered; staleness stays
+`BROADCAST_PUSH_RECENCY_MS`'s job.
 
 Guard order is cheapest-first so a duplicate never burns the gap window or a
 slot a genuinely new story needs.
