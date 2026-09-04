@@ -53,20 +53,34 @@ function checkAuth(req) {
 }
 
 // Command safety: allowlist of expected Redis commands.
-// Blocks dangerous operations like FLUSHALL, CONFIG SET, EVAL, DEBUG, SLAVEOF.
+// Blocks destructive/admin operations: FLUSHALL, FLUSHDB, CONFIG, DEBUG, SLAVEOF,
+// REPLICAOF, SHUTDOWN, KEYS, MIGRATE, CLUSTER.
+//
+// EVAL is ALLOWED, deliberately. It is not a safety regression: Upstash's REST API —
+// which this proxy is a drop-in replacement for — permits EVAL too, so denying it
+// here breaks parity rather than adding protection. Every EVAL in this repo is a
+// compare-and-delete / compare-and-set lock primitive with no non-Lua equivalent
+// (scripts/_seed-utils.mjs releaseLock, scripts/ais-relay.cjs, scripts/seed-forecasts.mjs,
+// scripts/seed-military-bases.mjs, server/_shared/redis.ts). Denying it does not fail
+// loudly everywhere either — pipeline callers surface it as a per-command {error} and
+// swallow it, so story tracking would silently stop incrementing. The trust boundary
+// is the bearer token above (timing-safe compare) plus keeping this proxy on the
+// private network wherever the caller can reach it privately — not this list.
 const ALLOWED_COMMANDS = new Set([
   'GET', 'SET', 'DEL', 'MGET', 'MSET', 'SCAN',
-  'TTL', 'EXPIRE', 'PEXPIRE', 'EXISTS', 'TYPE',
-  'HGET', 'HSET', 'HDEL', 'HGETALL', 'HMGET', 'HMSET', 'HKEYS', 'HVALS', 'HEXISTS', 'HLEN',
+  'TTL', 'EXPIRE', 'PEXPIRE', 'PERSIST', 'EXISTS', 'TYPE', 'COPY',
+  'HGET', 'HSET', 'HSETNX', 'HDEL', 'HGETALL', 'HMGET', 'HMSET', 'HKEYS', 'HVALS', 'HEXISTS', 'HLEN', 'HINCRBY',
   'LPUSH', 'RPUSH', 'LPOP', 'RPOP', 'LRANGE', 'LLEN', 'LTRIM', 'LREM',
   'SADD', 'SREM', 'SMEMBERS', 'SISMEMBER', 'SCARD',
-  'ZADD', 'ZREM', 'ZRANGE', 'ZRANGEBYSCORE', 'ZREVRANGE', 'ZSCORE', 'ZCARD', 'ZRANDMEMBER',
+  'ZADD', 'ZREM', 'ZRANGE', 'ZRANGEBYSCORE', 'ZREVRANGE', 'ZREVRANGEBYSCORE',
+  'ZSCORE', 'ZCARD', 'ZCOUNT', 'ZRANDMEMBER', 'ZREMRANGEBYSCORE', 'ZREMRANGEBYRANK',
   'GEOADD', 'GEOSEARCH', 'GEOPOS', 'GEODIST',
   'INCR', 'DECR', 'INCRBY', 'DECRBY',
   'PING', 'ECHO', 'INFO', 'DBSIZE',
   'PUBLISH', 'SUBSCRIBE',
   'SETNX', 'SETEX', 'PSETEX', 'GETSET',
   'APPEND', 'STRLEN',
+  'EVAL',
 ]);
 
 async function runCommand(args) {
@@ -202,6 +216,29 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`Redis REST proxy listening on 0.0.0.0:${PORT}`);
-});
+// Bind dual-stack. Railway's private network is IPv6-only, so a service reached at
+// <name>.railway.internal never connects to a listener bound to 0.0.0.0 — it just
+// hangs until the caller's timeout, which looks like "Redis is down" rather than a
+// bind problem. Binding '::' with ipv6Only unset (Node's default) accepts IPv4 too,
+// so the public ingress keeps working.
+//
+// Fall back to 0.0.0.0 where IPv6 is unavailable: the default docker-compose bridge
+// has no IPv6, and there listen('::') fails outright with EAFNOSUPPORT.
+const BIND_HOST = process.env.BIND_HOST || '::';
+
+function listen(host, isFallback = false) {
+  server.once('error', (err) => {
+    if (!isFallback && (err.code === 'EAFNOSUPPORT' || err.code === 'EADDRNOTAVAIL' || err.code === 'EINVAL')) {
+      console.warn(`IPv6 bind unavailable (${err.code}); falling back to 0.0.0.0`);
+      listen('0.0.0.0', true);
+      return;
+    }
+    console.error(`Failed to bind ${host}:${PORT}:`, err.message);
+    process.exit(1);
+  });
+  server.listen(PORT, host, () => {
+    console.log(`Redis REST proxy listening on ${host}:${PORT}`);
+  });
+}
+
+listen(BIND_HOST);
