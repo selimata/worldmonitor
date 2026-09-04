@@ -912,3 +912,38 @@ describe('i18n resilience', () => {
     assert.ok(warns.some((w) => w.includes('i18n returned no languages')), 'the miss must not be silent');
   });
 });
+
+describe('rate limits defer a story, never consume it', () => {
+  it('releases the dedup key when the min-gap blocks, so the next sweep retries', async () => {
+    const redis = fakeRedis();
+    const { dispatcher, fetchImpl } = makeDispatcher({ BROADCAST_PUSH_MIN_GAP_S: '900' }, { redis });
+    await dispatcher.observe({ ...CRITICAL, title: 'Winner' });
+    const loser = await dispatcher.observe({ ...CRITICAL, title: 'Bigger story that lost the race' });
+    assert.equal(loser.action, 'suppressed');
+    assert.match(loser.reason, /min-gap/);
+    // Gap expires; the same story must be eligible again rather than "already broadcast".
+    redis.store.delete('wm:broadcast-push:v1:gap');
+    const retry = await dispatcher.observe({ ...CRITICAL, title: 'Bigger story that lost the race' });
+    assert.equal(retry.action, 'sent', 'a story that never went out must not be burned for the dedup TTL');
+    assert.equal(fetchImpl.calls.length, 2);
+  });
+
+  it('releases the gap too when the caps reject — an unsent story must not silence 15min', async () => {
+    const redis = fakeRedis();
+    const { dispatcher } = makeDispatcher(
+      { BROADCAST_PUSH_MIN_GAP_S: '900', BROADCAST_PUSH_HOURLY_CAP: '1', BROADCAST_PUSH_DAILY_CAP: '1' },
+      { redis },
+    );
+    await dispatcher.observe({ ...CRITICAL, title: 'First' });           // consumes both caps
+    redis.store.delete('wm:broadcast-push:v1:gap');
+    const blocked = await dispatcher.observe({ ...CRITICAL, title: 'Second' });
+    assert.equal(blocked.action, 'suppressed');
+    assert.equal(redis.store.has('wm:broadcast-push:v1:gap'), false, 'a cap rejection must not leave the gap held');
+  });
+
+  it('a story that WAS sent keeps its dedup key', async () => {
+    const { dispatcher } = makeDispatcher();
+    assert.equal((await dispatcher.observe(CRITICAL)).action, 'sent');
+    assert.equal((await dispatcher.observe(CRITICAL)).action, 'suppressed');
+  });
+});

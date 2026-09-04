@@ -578,23 +578,46 @@ function createBroadcastPushDispatcher({ env, redis, translate, fetchImpl, log =
 
       const claimed = [dedupKey];
 
+      // A rate limiter must DEFER a story, never consume it. Releasing the
+      // dedup key on every rate-limited exit is what makes that true: the
+      // classify sweep re-observes the same headline every 15min, so a story
+      // that loses one window is simply reconsidered in the next.
+      //
+      // Keeping the key here (as this did until 2026-09-04) meant a story was
+      // burned for the full 6h dedup TTL the instant it lost a race it never
+      // had a chance at: each sweep classifies dozens of stories, exactly one
+      // can hold the gap, and the winner is whichever the loop reached first —
+      // not the most important. Observed that morning: "Iran war latest" and
+      // the Nepal flood toll were permanently discarded while a drone-tariff
+      // item went out, and 150 of 553 hook calls were "already broadcast" for
+      // stories nobody had ever received.
+      //
+      // Staleness is not this guard's job — BROADCAST_PUSH_RECENCY_MS already
+      // drops anything too old to be worth announcing, so a deferred story is
+      // either still timely when its turn comes or gets dropped there.
+      // Releases everything claimed so far, not just the dedup key: the min-gap
+      // means "15min between two actual broadcasts", so a gap held by a story
+      // the caps then rejected would silence the next 15min for nothing.
+      const deferAndRelease = async (reason) => {
+        await release(claimed);
+        return { action: 'suppressed', reason };
+      };
+
       if (minGapS > 0) {
         const gapKey = `${KEY_PREFIX}:gap`;
         const gapResult = await redis.setNx(gapKey, hash, minGapS);
         if (gapResult !== 'new') {
-          // The dedup key stays: this story lost the race but is still "seen",
-          // and re-broadcasting it after the gap expires would deliver stale news.
-          return { action: 'suppressed', reason: gapResult === 'duplicate' ? 'inside min-gap window' : `gap unavailable (${gapResult})` };
+          return deferAndRelease(gapResult === 'duplicate' ? 'inside min-gap window' : `gap unavailable (${gapResult})`);
         }
         claimed.push(gapKey);
       }
 
       const slotKey = await claimHourlySlot(hourBucket(now()));
-      if (!slotKey) return { action: 'suppressed', reason: 'hourly cap reached' };
+      if (!slotKey) return deferAndRelease('hourly cap reached');
       claimed.push(slotKey);
 
       const daySlot = await claimDailySlot(now());
-      if (!daySlot) return { action: 'suppressed', reason: 'daily cap reached' };
+      if (!daySlot) return deferAndRelease('daily cap reached');
       claimed.push(daySlot);
 
       const body = await localizedBody(headline);
