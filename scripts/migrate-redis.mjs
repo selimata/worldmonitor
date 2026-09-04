@@ -92,10 +92,42 @@ async function cmd(target, args) {
   return j.result;
 }
 
-/** Pipeline a batch; returns per-command {result}|{error} envelopes, order preserved. */
-async function pipeline(target, commands) {
+// A 500-key batch that happens to contain a few ~1MB ZSETs serializes into a
+// multi-megabyte request, and Railway's HTTP ingress answers that with a 502 long
+// before the proxy sees it. Bound every pipeline by BOTH byte size and command
+// count: reads are tiny commands with huge responses (cap by count), writes are
+// huge commands with tiny responses (cap by bytes).
+const MAX_PIPELINE_BYTES = 300_000; // 1MB still drew intermittent 502s from Railway's ingress
+const MAX_PIPELINE_CMDS = 200;
+
+/**
+ * Pipeline a batch, split across as many requests as the caps require.
+ * Returns per-command {result}|{error} envelopes, order preserved across chunks.
+ * Retries happen per chunk, so a late failure never replays earlier chunks.
+ */
+async function pipeline(target, commands, { maxCmds = MAX_PIPELINE_CMDS, maxBytes = MAX_PIPELINE_BYTES } = {}) {
   if (commands.length === 0) return [];
-  return call(target, commands, '/pipeline');
+  const out = [];
+  let batch = [];
+  let bytes = 0;
+
+  const flush = async () => {
+    if (batch.length === 0) return;
+    const sent = batch;
+    batch = [];
+    bytes = 0;
+    out.push(...(await withRetry(() => call(target, sent, '/pipeline'), 'pipeline')));
+  };
+
+  for (const c of commands) {
+    const size = JSON.stringify(c).length;
+    if (batch.length && (batch.length >= maxCmds || bytes + size > maxBytes)) await flush();
+    batch.push(c);
+    bytes += size;
+    if (bytes > maxBytes) await flush(); // oversized single command goes alone
+  }
+  await flush();
+  return out;
 }
 
 // Retry only transport-level failures. A rejected command (bad type, denied verb) is a
@@ -161,7 +193,9 @@ function buildWrites(key, type, ttl, value) {
 
     case 'list':
       if (!value?.length) return [];
-      return [...chunked(value, CHUNK).map((c) => ['RPUSH', key, ...c]), ...expire];
+      // DEL first: SET/HSET/SADD/ZADD are all idempotent, but RPUSH is not — a retried
+      // chunk or a --overwrite re-run would append the list to itself.
+      return [['DEL', key], ...chunked(value, CHUNK).map((c) => ['RPUSH', key, ...c]), ...expire];
 
     default:
       return null; // unsupported type — caller reports it
@@ -226,7 +260,7 @@ async function main() {
   for (const pattern of patterns) {
     let cursor = '0';
     do {
-      const scanArgs = ['SCAN', cursor, 'COUNT', '500'];
+      const scanArgs = ['SCAN', cursor, 'COUNT', '250'];
       if (pattern !== '*') scanArgs.push('MATCH', pattern);
       const [next, keys] = await withRetry(() => cmd(SRC, scanArgs), 'SCAN');
       cursor = next;
@@ -238,7 +272,7 @@ async function main() {
 
       let todo = batch;
       if (!OVERWRITE) {
-        const exists = await withRetry(() => pipeline(DST, todo.map((k) => ['EXISTS', k])), 'EXISTS');
+        const exists = await pipeline(DST, todo.map((k) => ['EXISTS', k]));
         todo = todo.filter((k, i) => {
           if (exists[i]?.result === 1) { stats.skipped++; return false; }
           return true;
@@ -247,10 +281,7 @@ async function main() {
       }
 
       // TYPE + TTL for the batch, then the type-specific read.
-      const meta = await withRetry(
-        () => pipeline(SRC, todo.flatMap((k) => [['TYPE', k], ['TTL', k]])),
-        'TYPE/TTL',
-      );
+      const meta = await pipeline(SRC, todo.flatMap((k) => [['TYPE', k], ['TTL', k]]));
 
       const reads = [];
       const pending = [];
@@ -269,7 +300,8 @@ async function main() {
       });
       if (pending.length === 0) continue;
 
-      const values = await withRetry(() => pipeline(SRC, reads), 'value read');
+      // Small command count, potentially enormous combined response — cap by count.
+      const values = await pipeline(SRC, reads, { maxCmds: 40 });
 
       const writes = [];
       const written = [];
@@ -291,7 +323,7 @@ async function main() {
       });
 
       if (writes.length && !DRY_RUN) {
-        const res = await withRetry(() => pipeline(DST, writes), 'write');
+        const res = await pipeline(DST, writes);
         const errs = res.filter((r) => r?.error);
         if (errs.length) {
           stats.failed += errs.length;

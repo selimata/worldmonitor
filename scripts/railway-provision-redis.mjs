@@ -125,9 +125,17 @@ async function main() {
       s: redisId,
       e: environmentId,
       i: {
+        // Wrapped in `sh -c` because Railway hands the start command to the image
+        // ENTRYPOINT as argv without a shell: an unwrapped --requirepass "$REDIS_PASSWORD"
+        // sets the password to the literal 7 characters "$REDIS_PASSWORD", and the proxy
+        // then fails with WRONGPASS while looking like a credential mix-up.
+        // Re-entering docker-entrypoint.sh (rather than exec'ing redis-server directly)
+        // keeps the image's own privilege drop: it only gosu's to the redis user when it
+        // sees `redis-server` as its first argument.
         startCommand:
-          'redis-server --requirepass "$REDIS_PASSWORD" --bind "0.0.0.0 -::"'
-          + ' --maxmemory 1gb --maxmemory-policy noeviction --appendonly yes --dir /data',
+          "sh -c 'exec docker-entrypoint.sh redis-server"
+          + ' --requirepass "$REDIS_PASSWORD" --bind "0.0.0.0 -::"'
+          + " --maxmemory 1gb --maxmemory-policy noeviction --appendonly yes --dir /data'",
         restartPolicyType: 'ALWAYS',
       },
     },
