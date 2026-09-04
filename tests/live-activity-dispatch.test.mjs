@@ -256,12 +256,14 @@ describe('observeCriticalAlert — restart-safe dedupe', () => {
     assert.equal(sender.sent.length, 0);
   });
 
-  it('the dedupe marker is SET NX with the 6h TTL', async () => {
+  it('the dedupe marker is SET NX with the started TTL', async () => {
     const { redis, dispatcher } = harness();
     await dispatcher.observeCriticalAlert(ALERT);
     const setNx = redis.calls.find((c) => c[0] === 'SET' && c[1] === dispatch.startedKey(ALERT_ID));
     assert.deepEqual(setNx.slice(3), ['NX', 'EX', String(dispatch.LIVE_ACTIVITY_STARTED_TTL_S)]);
-    assert.equal(dispatch.LIVE_ACTIVITY_STARTED_TTL_S, 6 * 60 * 60);
+    // 36h, not 6h: at 6h a story the feed keeps republishing raised a fresh
+    // card four times a day (CrisisWatch's Gaza ceasefire piece, for days).
+    assert.equal(dispatch.LIVE_ACTIVITY_STARTED_TTL_S, 36 * 60 * 60);
   });
 });
 
@@ -496,5 +498,35 @@ describe('statesByToken never ships the raw source language', () => {
   it('falls back failed translations to the English rendering, raw only as last resort', () => {
     assert.match(src, /const base = typeof titles\.en === 'string' && titles\.en\.trim\(\) \? clamp\(titles\.en\) : raw;/);
     assert.match(src, /byLang\.set\(lang, typeof t === 'string' && t\.trim\(\) \? clamp\(t\) : base\);/);
+  });
+});
+
+describe('one article, one card', () => {
+  const src = readFileSync(new URL('../scripts/lib/live-activity-dispatch.cjs', import.meta.url), 'utf-8');
+
+  it('claims the article URL as a second identity, so a re-wording cannot restart it', () => {
+    assert.match(src, /function startedLinkKey\(link\)/,
+      'deriveAlertId hashes the headline, which does not survive a re-wording or a translation');
+    assert.match(src, /already-started-link/);
+  });
+
+  it('normalises the URL so query strings and trailing slashes do not fork the identity', () => {
+    assert.match(src, /replace\(\/\[\?#\]\.\*\$\/, ''\)/);
+  });
+
+  it('releases the title key when the link key loses — both identities stay consistent', () => {
+    const i = src.indexOf('already-started-link');
+    const window = src.slice(i - 400, i);
+    assert.match(window, /DEL', startedKey\(alertId\)/,
+      'keeping the title key would leave the story half-started under one name');
+  });
+
+  it('imports createHash — startedLinkKey would throw at first use otherwise', () => {
+    assert.match(src, /require\('node:crypto'\)/);
+  });
+
+  it('keeps a started story marked long enough to outlive a republishing feed', () => {
+    assert.match(src, /LIVE_ACTIVITY_STARTED_TTL_S = 36 \* 60 \* 60/,
+      '6h let a story the feed keeps republishing raise a fresh card four times a day');
   });
 });

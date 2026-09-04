@@ -27,6 +27,7 @@
  * one-liner. Failures are logged and reported in the returned `action`.
  */
 
+const { createHash } = require('node:crypto');
 const { buildContentState, deriveAlertId, maskToken } = require('./apns-live-activity.cjs');
 
 const KEY_PUSH_TO_START = 'live-activity:push-to-start:v1';
@@ -56,7 +57,15 @@ const LIVE_ACTIVITY_START_WINDOW_MS = 60 * 60 * 1000;
 // events by mistake. A held story is not consumed: no dedupe marker is written
 // for it, so it competes again on the next classify pass.
 const LIVE_ACTIVITY_START_COOLDOWN_MS = 30 * 60 * 1000;
-const LIVE_ACTIVITY_STARTED_TTL_S = 6 * 60 * 60;
+/**
+ * How long a story stays "already started".
+ *
+ * Was 6h, which meant a story the feed keeps republishing raised a fresh card
+ * four times a day. CrisisWatch's Gaza ceasefire piece did exactly that for
+ * days. A day and a half covers a story's news cycle without pinning a genuine
+ * follow-up: a real development arrives with its own headline and link.
+ */
+const LIVE_ACTIVITY_STARTED_TTL_S = 36 * 60 * 60;
 const LIVE_ACTIVITY_ACTIVE_TTL_S = 5 * 60 * 60;
 const PUSH_TO_START_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const END_DISMISSAL_DELAY_S = 30 * 60;
@@ -68,6 +77,26 @@ function updateTokensKey(alertId) {
 
 function startedKey(alertId) {
   return `${KEY_STARTED_PREFIX}${alertId}`;
+}
+
+/**
+ * Second identity for the same story: its article URL.
+ *
+ * deriveAlertId hashes the headline, which the digest makes stable ACROSS
+ * outlets but not across re-wordings of one article. Observed 2026-09-03: one
+ * CrisisWatch piece started two cards seven hours apart as "Empty promises:
+ * ceasefire in Gaza restarted" and "Hollow Promises: Resetting Gaza's
+ * Ceasefire", plus Hebrew and Arabic renderings earlier — four cards, one
+ * article. A URL survives every re-wording and every translation.
+ *
+ * Checked IN ADDITION to the title key, never instead: a link is missing often
+ * enough that it cannot be the only identity, and a digest-merged cluster still
+ * dedupes correctly on its title.
+ */
+function startedLinkKey(link) {
+  const normalized = String(link || '').trim().toLowerCase().replace(/[?#].*$/, '').replace(/\/+$/, '');
+  if (!normalized) return '';
+  return `${KEY_STARTED_PREFIX}link:${createHash('sha256').update(normalized).digest('hex').slice(0, 24)}`;
 }
 
 /**
@@ -396,6 +425,19 @@ function createLiveActivityDispatcher({
 
         const won = await redis.command(['SET', startedKey(alertId), String(t), 'NX', 'EX', String(startedTtlS)]);
         if (won !== 'OK') return { action: 'noop', reason: 'already-started', alertId };
+
+        // The article's URL is claimed too, so the next re-wording of this same
+        // piece loses here instead of raising a second card. Releasing the
+        // title key on the way out keeps the two identities consistent: this
+        // story is "not started", by either name.
+        const linkKey = startedLinkKey(alert.link);
+        if (linkKey) {
+          const wonLink = await redis.command(['SET', linkKey, String(t), 'NX', 'EX', String(startedTtlS)]);
+          if (wonLink !== 'OK') {
+            await redis.command(['DEL', startedKey(alertId)]);
+            return { action: 'noop', reason: 'already-started-link', alertId };
+          }
+        }
 
         const record = {
           alertId,
