@@ -1734,6 +1734,23 @@
       ]
     },
     {
+      "host": "backboard.railway.app",
+      "provider": "Railway control plane",
+      "kind": "structured",
+      "observed": true,
+      "license": "Excluded: first-party, control-plane, UI, or rendering transport",
+      "attribution": "Excluded from the external-provider count: not an ingested upstream dataset.",
+      "status": "excluded",
+      "references": [
+        {
+          "path": "scripts/railway-cutover-redis.mjs"
+        },
+        {
+          "path": "scripts/railway-provision-redis.mjs"
+        }
+      ]
+    },
+    {
       "host": "balkaninsight.com",
       "provider": "balkaninsight.com",
       "kind": "feed",
@@ -7459,6 +7476,20 @@
         },
         {
           "path": "src/services/story-share.ts"
+        }
+      ]
+    },
+    {
+      "host": "redis-rest.railway.internal",
+      "provider": "Self-hosted Redis REST proxy",
+      "kind": "structured",
+      "observed": true,
+      "license": "Excluded: first-party, control-plane, UI, or rendering transport",
+      "attribution": "Excluded from the external-provider count: not an ingested upstream dataset.",
+      "status": "excluded",
+      "references": [
+        {
+          "path": "scripts/railway-provision-redis.mjs"
         }
       ]
     },

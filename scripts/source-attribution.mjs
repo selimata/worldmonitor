@@ -188,6 +188,23 @@ const PROVIDER_OVERRIDES = {
     attribution: 'Excluded from the external-provider count: not an ingested upstream dataset.',
     status: 'excluded',
   },
+  // Railway GraphQL control plane — reached only by the one-off scripts that
+  // provision and cut over the self-hosted Redis. No dashboard data crosses it.
+  'backboard.railway.app': {
+    provider: 'Railway control plane',
+    license: 'Excluded: first-party, control-plane, UI, or rendering transport',
+    attribution: 'Excluded from the external-provider count: not an ingested upstream dataset.',
+    status: 'excluded',
+  },
+  // Private-network address of this project's own Redis REST proxy (the managed
+  // Upstash replacement). It carries the cache, so every value behind it is
+  // already attributed to the upstream provider that produced it.
+  'redis-rest.railway.internal': {
+    provider: 'Self-hosted Redis REST proxy',
+    license: 'Excluded: first-party, control-plane, UI, or rendering transport',
+    attribution: 'Excluded from the external-provider count: not an ingested upstream dataset.',
+    status: 'excluded',
+  },
   'moxie.foxbusiness.com': licensedPublisherFeed('Fox Business'),
   'www.wired.com': licensedPublisherFeed('Wired'),
   'www.businessinsider.com': licensedPublisherFeed('Business Insider'),
@@ -839,13 +856,13 @@ const PROVIDER_OVERRIDES = {
 // a provider-bearing override a separate, explicit lifecycle event instead of
 // something `--write` can silently normalize into the manifest.
 export const PROVIDER_IDENTITY_REVIEW = Object.freeze({
-  sha256: 'e0a6f7e58615021e78487404598e87fa96d0755c1dd62b897e601342036cbf67',
-  reason: 'Register world-monitor-app.vercel.app as first-party. The broadcast push hook posts to its /api/push/send, and the host is first-party in exactly the sense the worldmonitor.app entries are — but on a vercel.app domain, so the `.worldmonitor.app` suffix rule cannot reach it and it must be named. Excluded, so it adds no external provider. Prior epoch: keep Toronto Police Service C4S live-dispatch on services.arcgis.com distinct from Toronto Police Service Open Data on data.tps.ca and www.tps.ca, so live CAD is not catalogued as Open Data / geopolitics.',
+  sha256: '8243b97c1956730b96481593d2c80cd5876a54129764331575e7629e5fabfdac',
+  reason: 'Register the two hosts introduced by moving the cache off managed Upstash onto a self-hosted Redis. backboard.railway.app is Railway\'s GraphQL control plane, reached only by the provisioning and cutover scripts that stand up that Redis. redis-rest.railway.internal is the private-network address of this project\'s own REST proxy in front of it — it carries the cache, so every value behind it is already attributed to the upstream provider that produced it. Both are excluded, so neither adds an external provider; they are named because control-plane and first-party transport hosts have no suffix rule that reaches them. Prior epoch: register world-monitor-app.vercel.app as first-party, since the broadcast push hook posts to its /api/push/send and the `.worldmonitor.app` suffix rule cannot reach a vercel.app domain. Epoch before that: keep Toronto Police Service C4S live-dispatch on services.arcgis.com distinct from Toronto Police Service Open Data on data.tps.ca and www.tps.ca, so live CAD is not catalogued as Open Data / geopolitics.',
   // A URL cited here is scanned like any other: this file sits inside
   // SOURCE_ROOTS, so citing a host that is not already a registered source
   // invents a provider row for it. The B.C. catalogue URLs above are safe
   // because that host is itself an observed source; parallel.ai is not.
-  reviewReference: 'Issues #7012 and #6682 Toronto safety sources; plus Issue #7000 publisher-centric source catalog; plus Issue #7001, Issue #6437, Issue #6622, Issue #6659, and PR #6447 identity reviews.',
+  reviewReference: 'Upstash-to-self-hosted-Redis migration, commits 6892e2128 and cd13fd6f0; plus Issues #7012 and #6682 Toronto safety sources; plus Issue #7000 publisher-centric source catalog; plus Issue #7001, Issue #6437, Issue #6622, Issue #6659, and PR #6447 identity reviews.',
 });
 
 export function providerIdentityDigest(providerOverrides = PROVIDER_OVERRIDES) {
