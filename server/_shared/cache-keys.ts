@@ -25,6 +25,12 @@ export const DIGEST_ACCUMULATOR_KEY_PREFIX = 'digest:accumulator:v1:';
  * All keys use 32-char SHA-256 hex prefix of the normalised title as ${titleHash}.
  *
  *   story:track:v1:${titleHash}     Hash   firstSeen/lastSeen/title/link/severity/mentionCount/currentScore/lang/description/publishedAt/entityCorroborationCount/isOpinion/isFeelGood/isEphemeralLiveCoverage/category (always-written)
+ *                                          plus ttlAt — bookkeeping, not story data: when this row's
+ *                                          three keys last had their TTL pushed forward, so a build
+ *                                          can skip re-EXPIREing keys it already refreshed today.
+ *                                          Absent on rows written before it existed, which reads as
+ *                                          "refresh now". HGETALL consumers (seed-digest-notifications,
+ *                                          audit-static-page-contamination) read named fields only.
  *   story:sources:v1:${titleHash}   Set    feed IDs (SADD per appearance)
  *   story:peak:v1:${titleHash}      ZSet   single member "peak", score = highest importanceScore (ZADD GT)
  *   digest:accumulator:v1:${variant}:${lang} ZSet  member=titleHash, score=lastSeen_ms (updated every appearance)
