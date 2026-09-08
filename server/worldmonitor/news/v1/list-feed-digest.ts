@@ -1156,6 +1156,13 @@ interface StoryTrack {
   sourceCount: number;
   currentScore: number;
   peakScore: number;
+  /**
+   * When this story's three keys (track/sources/peak) last had their 7-day TTL
+   * pushed forward. Not a data field — it exists so writeStoryTracking can skip
+   * re-EXPIREing on every cycle. Absent on rows written before this field, which
+   * reads as "refresh now" and self-heals on first touch.
+   */
+  ttlAt?: number;
 }
 
 function derivePhase(track: StoryTrack): ProtoStoryPhase {
@@ -1175,7 +1182,9 @@ function derivePhase(track: StoryTrack): ProtoStoryPhase {
  */
 async function readStoryTracks(titleHashes: string[]): Promise<Map<string, StoryTrack>> {
   if (titleHashes.length === 0) return new Map();
-  const fields = ['firstSeen', 'lastSeen', 'mentionCount', 'sourceCount', 'currentScore', 'peakScore'];
+  // ttlAt rides along in the existing HMGET — one more field on a command we
+  // already send, so the TTL-refresh decision below costs zero extra commands.
+  const fields = ['firstSeen', 'lastSeen', 'mentionCount', 'sourceCount', 'currentScore', 'peakScore', 'ttlAt'];
   const commands = titleHashes.map(h => [
     'HMGET', STORY_TRACK_KEY(h), ...fields,
   ]);
@@ -1191,6 +1200,9 @@ async function readStoryTracks(titleHashes: string[]): Promise<Map<string, Story
       sourceCount:  Number(vals[3] ?? 0),
       currentScore: Number(vals[4] ?? 0),
       peakScore:    Number(vals[5] ?? 0),
+      // undefined (not 0) when the field is absent — 0 would read as "refreshed
+      // at the epoch", which is also "stale", but undefined says so honestly.
+      ttlAt:        vals[6] == null || vals[6] === '' ? undefined : Number(vals[6]),
     });
   }
   return map;
@@ -1300,6 +1312,10 @@ export async function listFeedDigest(
 }
 
 const STORY_BATCH_SIZE = 80; // keeps each pipeline call well under Upstash's 1000-command cap
+// How stale a story's `ttlAt` may get before its 7-day TTL is pushed forward again.
+// One day leaves a 7x margin; the digest rebuilds far more often than that, so the
+// EXPIREs land on roughly 1 cycle in 144 instead of every single one.
+const STORY_TTL_REFRESH_MS = 86_400_000;
 
 /**
  * Build the HSET field list for a story:track:v1 row.
@@ -1381,7 +1397,7 @@ function buildStoryTrackHsetFields(
   ];
 }
 
-async function writeStoryTracking(items: ParsedItem[], variant: string, lang: string, hashes: string[], memberHashesByFinal?: Map<string, Set<string>>): Promise<void> {
+async function writeStoryTracking(items: ParsedItem[], variant: string, lang: string, hashes: string[], memberHashesByFinal?: Map<string, Set<string>>, storyTracks?: Map<string, StoryTrack>): Promise<void> {
   if (items.length === 0) return;
   const now = Date.now();
   const accKey = DIGEST_ACCUMULATOR_KEY(variant, lang);
@@ -1428,17 +1444,42 @@ async function writeStoryTracking(items: ParsedItem[], variant: string, lang: st
       const nowStr = String(now);
       const ttl = STORY_TTL;
 
-      if (!writtenHashes.has(hash)) {
+      const stale = storyTracks?.get(hash);
+      // The three EXPIREs used to fire on every item of every cycle — ~10 minutes
+      // apart, pushing a 7-day TTL forward that had barely moved. Refresh once a
+      // day instead and the margin is still 7x. `ttlAt` comes free with the
+      // readStoryTracks HMGET, so the decision costs nothing to make.
+      //
+      // Skipping EXPIRE is only safe because it cannot strand a key without one:
+      // track/sources/peak share a TTL set in the same cycle, so they expire
+      // together and a survivor always has a live `ttlAt` next to it. If one is
+      // ever recreated alone (a partial write, a code path that drops it), the
+      // ZADD/SADD below revives it TTL-less for at most one refresh interval —
+      // bounded, not the permanent leak #4924 fixed.
+      const refreshTtl = stale?.ttlAt === undefined || (now - stale.ttlAt) > STORY_TTL_REFRESH_MS;
+      const firstOfHash = !writtenHashes.has(hash);
+
+      if (firstOfHash) {
         writtenHashes.add(hash);
         const representative = representativeByHash.get(hash) ?? item;
         const hsetFields = buildStoryTrackHsetFields(representative, nowStr, representative.importanceScore);
+        if (refreshTtl) hsetFields.push('ttlAt', nowStr);
         commands.push(
+          // Stays HINCRBY rather than folding into the HSET above: variants and
+          // languages build concurrently over a shared story hash, and two builds
+          // that both read mentionCount=N would both HSET N+1. The read path
+          // treats mentionCount as +1/cycle to drive DEVELOPING → SUSTAINED, so
+          // an undercount here silently stalls phase progression.
           ['HINCRBY', trackKey, 'mentionCount', '1'],
           ['HSET', trackKey, ...hsetFields],
-          ['HSETNX', trackKey, 'firstSeen', nowStr],
-          ['EXPIRE', trackKey, ttl],
-          ['ZADD', accKey, nowStr, hash],
         );
+        // firstSeen is immutable and already known once the row exists — writing
+        // it again every cycle bought nothing. Still HSETNX (not HSET) on the
+        // new-story path so a concurrent build that got there first keeps its
+        // earlier timestamp.
+        if (!stale) commands.push(['HSETNX', trackKey, 'firstSeen', nowStr]);
+        if (refreshTtl) commands.push(['EXPIRE', trackKey, ttl]);
+        commands.push(['ZADD', accKey, nowStr, hash]);
         // #4924: alias rows for every member exact-title hash -> the FINAL
         // (post-adoption) canonical, story-track TTL — next cycle's
         // adoption source. Includes the canonical's own hash.
@@ -1450,14 +1491,19 @@ async function writeStoryTracking(items: ParsedItem[], variant: string, lang: st
       commands.push(
         ['ZADD', peakKey, 'GT', score, 'peak'],
         ['SADD', sourcesKey, item.source],
-        // #4924 review P2 (TTL ordering): EXPIRE must follow the SADD/ZADD
-        // that CREATE these keys — EXPIRE on a missing key is a no-op, so
-        // the pre-block ordering left brand-new story:sources/story:peak
-        // keys persistent forever. Idempotent per member; kept adjacent to
-        // the creating writes so no future reorder can reopen the leak.
-        ['EXPIRE', sourcesKey, ttl],
-        ['EXPIRE', peakKey, ttl],
       );
+      // #4924 review P2 (TTL ordering): EXPIRE must follow the SADD/ZADD
+      // that CREATE these keys — EXPIRE on a missing key is a no-op, so
+      // the pre-block ordering left brand-new story:sources/story:peak
+      // keys persistent forever. Emitted after the creating writes for that
+      // reason, and only for the first member of the hash: both keys are
+      // per-story, so the other members were re-EXPIREing the same two keys.
+      if (firstOfHash && refreshTtl) {
+        commands.push(
+          ['EXPIRE', sourcesKey, ttl],
+          ['EXPIRE', peakKey, ttl],
+        );
+      }
     }
 
     await runRedisPipeline(commands);
@@ -1763,7 +1809,9 @@ async function buildDigest(variant: string, lang: string): Promise<ListFeedDiges
     const storyTracks = await readStoryTracks(uniqueHashes).catch(() => new Map<string, StoryTrack>());
 
     // Write story tracking. Errors never fail the digest build.
-    await writeStoryTracking(allSliced, variant, lang, titleHashes, memberHashesByFinal).catch((err: unknown) =>
+    // storyTracks is passed in rather than re-read: it carries `ttlAt`, which
+    // decides whether this cycle needs to re-EXPIRE each story's keys at all.
+    await writeStoryTracking(allSliced, variant, lang, titleHashes, memberHashesByFinal, storyTracks).catch((err: unknown) =>
       console.warn('[digest] story tracking write failed:', err),
     );
 
@@ -1850,6 +1898,8 @@ export const __testing__ = {
   computeEntityCorroborationSignals,
   computeEntityCorroborationCounts,
   readStoryTracks,
+  writeStoryTracking,
+  STORY_TTL_REFRESH_MS,
   resolveMaxAgeMs,
   capLlmUpgrade,
   parseClassifyCacheHit,

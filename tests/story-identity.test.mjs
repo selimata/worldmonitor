@@ -399,8 +399,13 @@ describe('list-feed-digest story-identity wiring (#4924 review)', () => {
 
   it('mentionCount increments once per unique hash per cycle, not once per member', () => {
     const hincrbyAt = digestSrc.indexOf("['HINCRBY', trackKey, 'mentionCount', '1']");
-    const guardAt = digestSrc.indexOf('if (!writtenHashes.has(hash))');
+    // The guard is computed before the block so the per-member section below can
+    // also ask "is this the first member of this hash?" — the TTL refresh rides
+    // on the same answer. Assert on that binding rather than an inline `if`.
+    const guardAt = digestSrc.indexOf('const firstOfHash = !writtenHashes.has(hash);');
     assert.ok(guardAt > -1, 'unique-hash guard must exist');
+    assert.ok(digestSrc.indexOf('if (firstOfHash) {', guardAt) > guardAt,
+      'the once-per-hash block must branch on that guard');
     assert.ok(hincrbyAt > guardAt, 'HINCRBY must sit inside the once-per-hash guard');
     // Per-member set-shaped writes stay outside the guard.
     const saddAt = digestSrc.indexOf("['SADD', sourcesKey, item.source]");

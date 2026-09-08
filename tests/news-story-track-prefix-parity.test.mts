@@ -53,6 +53,9 @@ describe("news digest story tracking Redis key prefix parity", () => {
         "sourceCount",
         "currentScore",
         "peakScore",
+        // Not story data: writeStoryTracking reads it to decide whether this
+        // cycle still needs to push the 7-day TTL forward.
+        "ttlAt",
       ],
     ]]);
   });
