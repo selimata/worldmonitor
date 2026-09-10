@@ -78,7 +78,14 @@ export function parseRegisterBody(body) {
   // already carries — an older client simply keeps today's behaviour.
   const rawLang = typeof body.lang === 'string' ? body.lang.trim().toLowerCase().split(/[-_]/)[0] : '';
   const lang = LANG_RE.test(rawLang) ? rawLang : 'en';
-  return { ok: true, value: { token, kind, activityId, lang } };
+  // The app's Push Alerts toggle. `false` deregisters the token instead of
+  // registering it; anything else (including absent, i.e. an older client) keeps
+  // the historical register behaviour. Without this the toggle cannot reach the
+  // Live Activity audience at all: tokens are only ever pruned by the 30-day
+  // sweep or by APNs rejecting them, so a user who switched alerts off still had
+  // activities pushed to their Lock Screen for a month.
+  const enabled = body.enabled === false ? false : true;
+  return { ok: true, value: { token, kind, activityId, lang, enabled } };
 }
 
 /**
@@ -87,7 +94,23 @@ export function parseRegisterBody(body) {
  * @param {number} nowMs
  * @returns {string[][]}
  */
-export function buildRegisterCommands({ token, kind, activityId, lang = 'en' }, nowMs) {
+export function buildRegisterCommands({ token, kind, activityId, lang = 'en', enabled = true }, nowMs) {
+  // Opting out: drop the token from the audience it is in, and forget its
+  // language. Same command shapes live-activity-dispatch.cjs uses when APNs
+  // reports a token dead, so there is one removal path to reason about.
+  if (enabled === false) {
+    if (kind === 'push-to-start') {
+      return [
+        ['ZREM', PUSH_TO_START_KEY, token],
+        ['HDEL', LANG_KEY, token],
+      ];
+    }
+    return [
+      ['HDEL', `${UPDATE_KEY_PREFIX}${activityId}`, token],
+      ['HDEL', LANG_KEY, token],
+    ];
+  }
+
   // One hash for both kinds; same 30-day horizon as the push-to-start set.
   const langCommands = [
     ['HSET', LANG_KEY, token, lang],

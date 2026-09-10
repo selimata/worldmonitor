@@ -98,12 +98,26 @@ describe('parseRegisterBody', () => {
   it('accepts push-to-start and update registrations, lowercasing the token', () => {
     // No lang on the body — an older client — is English, which is the wire language.
     assert.deepEqual(parseRegisterBody({ token: PTS_TOKEN, kind: 'push-to-start' }), {
-      ok: true, value: { token: PTS_TOKEN.toLowerCase(), kind: 'push-to-start', activityId: null, lang: 'en' },
+      ok: true, value: { token: PTS_TOKEN.toLowerCase(), kind: 'push-to-start', activityId: null, lang: 'en', enabled: true },
     });
     assert.deepEqual(parseRegisterBody({ token: UPDATE_TOKEN, kind: 'update', activityId: 'abc123def456', lang: 'TR' }), {
-      ok: true, value: { token: UPDATE_TOKEN, kind: 'update', activityId: 'abc123def456', lang: 'tr' },
+      ok: true, value: { token: UPDATE_TOKEN, kind: 'update', activityId: 'abc123def456', lang: 'tr', enabled: true },
     });
     assert.equal(parseRegisterBody({ token: PTS_TOKEN, kind: 'push-to-start', lang: 'nonsense' }).value.lang, 'en');
+  });
+
+  it('only an explicit false opts out — a missing flag is an older client, not a deregistration', () => {
+    assert.equal(parseRegisterBody({ token: PTS_TOKEN, kind: 'push-to-start', enabled: false }).value.enabled, false);
+    assert.equal(parseRegisterBody({ token: PTS_TOKEN, kind: 'push-to-start' }).value.enabled, true);
+    // Anything non-boolean is treated as "register", so a malformed field can
+    // never silently unsubscribe a device that meant to sign up.
+    for (const junk of [undefined, null, 0, '', 'false', 'no']) {
+      assert.equal(
+        parseRegisterBody({ token: PTS_TOKEN, kind: 'push-to-start', enabled: junk }).value.enabled,
+        true,
+        `enabled=${JSON.stringify(junk)} must not deregister`,
+      );
+    }
   });
 
   it('rejects malformed bodies with a specific error', () => {
@@ -131,6 +145,25 @@ describe('buildRegisterCommands', () => {
     ]);
     assert.equal(PUSH_TO_START_KEY, 'live-activity:push-to-start:v1');
     assert.equal(PUSH_TO_START_TTL_SECONDS, 30 * 24 * 60 * 60);
+  });
+
+  it('enabled:false removes the token from its audience and forgets its language', () => {
+    const now = 1_800_000_000_000;
+    assert.deepEqual(
+      buildRegisterCommands({ token: 'ab', kind: 'push-to-start', activityId: null, lang: 'tr', enabled: false }, now),
+      [['ZREM', PUSH_TO_START_KEY, 'ab'], ['HDEL', LANG_KEY, 'ab']],
+    );
+    assert.deepEqual(
+      buildRegisterCommands({ token: 'cd', kind: 'update', activityId: 'alert1', lang: 'tr', enabled: false }, now),
+      [['HDEL', `${UPDATE_KEY_PREFIX}alert1`, 'cd'], ['HDEL', LANG_KEY, 'cd']],
+    );
+  });
+
+  it('a body with no enabled flag still registers, so older clients are unaffected', () => {
+    const now = 1_800_000_000_000;
+    const cmds = buildRegisterCommands({ token: 'ab', kind: 'push-to-start', activityId: null, lang: 'tr' }, now);
+    assert.equal(cmds[0][0], 'ZADD');
+    assert.ok(!cmds.some((c) => c[0] === 'ZREM'));
   });
 
   it('update: HSET token under the activity hash with a 24h TTL', () => {
