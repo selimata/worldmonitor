@@ -33,6 +33,13 @@ export const REGISTER_KINDS = Object.freeze(['push-to-start', 'update']);
 // with the token list it is already fanning out to, so the alert headline can be
 // translated per language before it is pushed.
 export const LANG_KEY = 'live-activity:lang:v1';
+// token -> RevenueCat app user id. Purely for support: an ActivityKit token is
+// opaque and lives in its own store, so without this a complaint ("I turned
+// notifications off and still get cards") cannot be traced to a device at all —
+// which is exactly what happened on 2026-09-16, when the reporter's push row
+// was correctly disabled and their Live Activity token could not be found.
+// Never used to decide delivery; the Push Alerts toggle does that.
+export const RC_KEY = 'live-activity:rc:v1';
 
 // Per-IP budget, enforced in-handler like api/wm-session.js. A device
 // registers at most a handful of tokens per launch; 30/min is generous.
@@ -85,7 +92,11 @@ export function parseRegisterBody(body) {
   // sweep or by APNs rejecting them, so a user who switched alerts off still had
   // activities pushed to their Lock Screen for a month.
   const enabled = body.enabled === false ? false : true;
-  return { ok: true, value: { token, kind, activityId, lang, enabled } };
+  // Optional and length-capped: an older client simply sends nothing, and a
+  // bogus value must not become an unbounded Redis field.
+  const rawRc = typeof body.revenueCatId === 'string' ? body.revenueCatId.trim() : '';
+  const revenueCatId = rawRc.length > 0 && rawRc.length <= 128 ? rawRc : null;
+  return { ok: true, value: { token, kind, activityId, lang, enabled, revenueCatId } };
 }
 
 /**
@@ -94,7 +105,7 @@ export function parseRegisterBody(body) {
  * @param {number} nowMs
  * @returns {string[][]}
  */
-export function buildRegisterCommands({ token, kind, activityId, lang = 'en', enabled = true }, nowMs) {
+export function buildRegisterCommands({ token, kind, activityId, lang = 'en', enabled = true, revenueCatId = null }, nowMs) {
   // Opting out: drop the token from the audience it is in, and forget its
   // language. Same command shapes live-activity-dispatch.cjs uses when APNs
   // reports a token dead, so there is one removal path to reason about.
@@ -103,11 +114,13 @@ export function buildRegisterCommands({ token, kind, activityId, lang = 'en', en
       return [
         ['ZREM', PUSH_TO_START_KEY, token],
         ['HDEL', LANG_KEY, token],
+        ['HDEL', RC_KEY, token],
       ];
     }
     return [
       ['HDEL', `${UPDATE_KEY_PREFIX}${activityId}`, token],
       ['HDEL', LANG_KEY, token],
+      ['HDEL', RC_KEY, token],
     ];
   }
 
@@ -115,6 +128,12 @@ export function buildRegisterCommands({ token, kind, activityId, lang = 'en', en
   const langCommands = [
     ['HSET', LANG_KEY, token, lang],
     ['EXPIRE', LANG_KEY, String(PUSH_TO_START_TTL_SECONDS)],
+    // Same horizon as the language hash; omitted entirely for older clients so
+    // a re-register never blanks an id we already hold.
+    ...(revenueCatId ? [
+      ['HSET', RC_KEY, token, revenueCatId],
+      ['EXPIRE', RC_KEY, String(PUSH_TO_START_TTL_SECONDS)],
+    ] : []),
   ];
   if (kind === 'push-to-start') {
     const cutoff = nowMs - PUSH_TO_START_TTL_SECONDS * 1000;

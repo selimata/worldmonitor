@@ -35,6 +35,9 @@ const KEY_ACTIVE = 'live-activity:active:v1';
 const KEY_UPDATE_PREFIX = 'live-activity:update:v1:';
 const KEY_STARTED_PREFIX = 'live-activity:started:v1:';
 const KEY_LANG = 'live-activity:lang:v1';
+// Support-only token -> RevenueCat id map, written by api/live-activity/register.js.
+// Pruned alongside the language hash so a dead token leaves nothing behind.
+const KEY_RC = 'live-activity:rc:v1';
 const KEY_LAST_START = 'live-activity:last-start:v1';
 // Mirrors TITLE_MAX_CHARS in apns-live-activity.cjs: a translated headline is
 // subject to the same payload budget as the English one.
@@ -324,7 +327,7 @@ function createLiveActivityDispatcher({
       tokens,
       'update',
       (token) => sender.sendEnd(token, stateByToken.get(token) || base, dismissalDate),
-      (token) => redis.pipeline([['HDEL', updateTokensKey(alertId), token], ['HDEL', KEY_LANG, token]]),
+      (token) => redis.pipeline([['HDEL', updateTokensKey(alertId), token], ['HDEL', KEY_LANG, token], ['HDEL', KEY_RC, token]]),
     );
     // Only clear the active slot if it still points at this alert.
     const current = await readActive();
@@ -352,7 +355,7 @@ function createLiveActivityDispatcher({
       tokens,
       'push-to-start',
       (token) => sender.sendStart(token, { alertId, startedAt: record.startedAt, contentState: stateByToken.get(token) || base }),
-      (token) => redis.pipeline([['ZREM', KEY_PUSH_TO_START, token], ['HDEL', KEY_LANG, token]]),
+      (token) => redis.pipeline([['ZREM', KEY_PUSH_TO_START, token], ['HDEL', KEY_LANG, token], ['HDEL', KEY_RC, token]]),
     );
     log.log(`[LiveActivity] started ${alertId} "${base.title.slice(0, 80)}" — push-to-start sent to ${stats.sent}/${stats.attempted} tokens${stats.dryRun ? ' [dry-run]' : ''}`);
     return { action: 'started', alertId, superseded: previous ? previous.alertId : null, ...stats };
@@ -367,7 +370,7 @@ function createLiveActivityDispatcher({
       tokens,
       'update',
       (token) => sender.sendUpdate(token, stateByToken.get(token) || base),
-      (token) => redis.pipeline([['HDEL', updateTokensKey(alertId), token], ['HDEL', KEY_LANG, token]]),
+      (token) => redis.pipeline([['HDEL', updateTokensKey(alertId), token], ['HDEL', KEY_LANG, token], ['HDEL', KEY_RC, token]]),
     );
     log.log(`[LiveActivity] updated ${alertId} reports=${record.reports} — update sent to ${stats.sent}/${stats.attempted} tokens${stats.dryRun ? ' [dry-run]' : ''}`);
     return { action: 'updated', alertId, reports: record.reports, ...stats };
@@ -496,6 +499,7 @@ function createLiveActivityDispatcher({
 module.exports = {
   KEY_ACTIVE,
   KEY_LANG,
+  KEY_RC,
   KEY_LAST_START,
   KEY_PUSH_TO_START,
   KEY_STARTED_PREFIX,

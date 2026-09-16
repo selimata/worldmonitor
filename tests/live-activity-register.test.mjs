@@ -21,6 +21,7 @@ const {
   PUSH_TO_START_KEY,
   UPDATE_KEY_PREFIX,
   LANG_KEY,
+  RC_KEY,
   PUSH_TO_START_TTL_SECONDS,
   UPDATE_TOKEN_TTL_SECONDS,
 } = await import('../api/live-activity/register.js');
@@ -98,10 +99,10 @@ describe('parseRegisterBody', () => {
   it('accepts push-to-start and update registrations, lowercasing the token', () => {
     // No lang on the body — an older client — is English, which is the wire language.
     assert.deepEqual(parseRegisterBody({ token: PTS_TOKEN, kind: 'push-to-start' }), {
-      ok: true, value: { token: PTS_TOKEN.toLowerCase(), kind: 'push-to-start', activityId: null, lang: 'en', enabled: true },
+      ok: true, value: { token: PTS_TOKEN.toLowerCase(), kind: 'push-to-start', activityId: null, lang: 'en', enabled: true, revenueCatId: null },
     });
     assert.deepEqual(parseRegisterBody({ token: UPDATE_TOKEN, kind: 'update', activityId: 'abc123def456', lang: 'TR' }), {
-      ok: true, value: { token: UPDATE_TOKEN, kind: 'update', activityId: 'abc123def456', lang: 'tr', enabled: true },
+      ok: true, value: { token: UPDATE_TOKEN, kind: 'update', activityId: 'abc123def456', lang: 'tr', enabled: true, revenueCatId: null },
     });
     assert.equal(parseRegisterBody({ token: PTS_TOKEN, kind: 'push-to-start', lang: 'nonsense' }).value.lang, 'en');
   });
@@ -151,11 +152,11 @@ describe('buildRegisterCommands', () => {
     const now = 1_800_000_000_000;
     assert.deepEqual(
       buildRegisterCommands({ token: 'ab', kind: 'push-to-start', activityId: null, lang: 'tr', enabled: false }, now),
-      [['ZREM', PUSH_TO_START_KEY, 'ab'], ['HDEL', LANG_KEY, 'ab']],
+      [['ZREM', PUSH_TO_START_KEY, 'ab'], ['HDEL', LANG_KEY, 'ab'], ['HDEL', RC_KEY, 'ab']],
     );
     assert.deepEqual(
       buildRegisterCommands({ token: 'cd', kind: 'update', activityId: 'alert1', lang: 'tr', enabled: false }, now),
-      [['HDEL', `${UPDATE_KEY_PREFIX}alert1`, 'cd'], ['HDEL', LANG_KEY, 'cd']],
+      [['HDEL', `${UPDATE_KEY_PREFIX}alert1`, 'cd'], ['HDEL', LANG_KEY, 'cd'], ['HDEL', RC_KEY, 'cd']],
     );
   });
 
@@ -271,5 +272,27 @@ describe('POST /api/live-activity/register', () => {
     mockUpstash({ registerBody: [{ result: 1 }, { error: 'WRONGTYPE' }, { result: 1 }] });
     const partial = await handler(makeReq({ key: await sessionKey(), body: { token: PTS_TOKEN, kind: 'push-to-start' } }));
     assert.equal(partial.status, 503);
+  });
+});
+
+describe('RevenueCat identity', () => {
+  it('stores the id alongside the language, on the same horizon', () => {
+    const cmds = buildRegisterCommands(
+      { token: 'ab', kind: 'push-to-start', activityId: null, lang: 'tr', revenueCatId: '$RCAnonymousID:abc' },
+      1_800_000_000_000,
+    );
+    assert.ok(cmds.some((c) => c[0] === 'HSET' && c[1] === RC_KEY && c[3] === '$RCAnonymousID:abc'));
+    assert.ok(cmds.some((c) => c[0] === 'EXPIRE' && c[1] === RC_KEY));
+  });
+
+  it('writes nothing when absent, so an older client never blanks a stored id', () => {
+    const cmds = buildRegisterCommands({ token: 'ab', kind: 'push-to-start', activityId: null, lang: 'tr' }, 1);
+    assert.equal(cmds.some((c) => c[1] === RC_KEY), false);
+  });
+
+  it('caps the length — a bogus value must not become an unbounded field', () => {
+    assert.equal(parseRegisterBody({ token: PTS_TOKEN, kind: 'push-to-start', revenueCatId: 'x'.repeat(129) }).value.revenueCatId, null);
+    assert.equal(parseRegisterBody({ token: PTS_TOKEN, kind: 'push-to-start', revenueCatId: '  ' }).value.revenueCatId, null);
+    assert.equal(parseRegisterBody({ token: PTS_TOKEN, kind: 'push-to-start', revenueCatId: 42 }).value.revenueCatId, null);
   });
 });
