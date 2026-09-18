@@ -17,6 +17,7 @@
 
 import http from 'node:http';
 import crypto from 'node:crypto';
+import zlib from 'node:zlib';
 import { createClient } from 'redis';
 
 const REDIS_URL = process.env.SRH_CONNECTION_STRING || process.env.REDIS_URL || 'redis://redis:6379';
@@ -108,6 +109,26 @@ async function readBody(req) {
   return Buffer.concat(chunks).toString();
 }
 
+// Responses leave Railway's network to Vercel as billed egress. Gzip any 200
+// payload above ~1 KB when the client advertises gzip (Node's fetch always does
+// and transparently inflates). Clients that don't advertise it get the exact
+// bytes they got before.
+const GZIP_MIN_BYTES = 1024;
+
+function sendJson(req, res, body) {
+  const accept = String(req.headers?.['accept-encoding'] || '');
+  if (body.length >= GZIP_MIN_BYTES && /(^|,)\s*gzip\s*(;|,|$)/i.test(accept)) {
+    const gz = zlib.gzipSync(body);
+    res.setHeader('content-encoding', 'gzip');
+    res.setHeader('vary', 'accept-encoding');
+    res.writeHead(200);
+    res.end(gz);
+    return;
+  }
+  res.writeHead(200);
+  res.end(body);
+}
+
 const server = http.createServer(async (req, res) => {
   res.setHeader('content-type', 'application/json');
 
@@ -122,8 +143,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && (req.url === '/' || req.url === '')) {
       const body = JSON.parse(await readBody(req));
       const result = await runCommand(body);
-      res.writeHead(200);
-      res.end(JSON.stringify({ result }));
+      sendJson(req, res, JSON.stringify({ result }));
       return;
     }
 
@@ -139,8 +159,7 @@ const server = http.createServer(async (req, res) => {
           results.push({ error: err.message });
         }
       }
-      res.writeHead(200);
-      res.end(JSON.stringify(results));
+      sendJson(req, res, JSON.stringify(results));
       return;
     }
 
@@ -158,8 +177,7 @@ const server = http.createServer(async (req, res) => {
         multi.sendCommand(cmd.map(String));
       }
       const results = await multi.exec();
-      res.writeHead(200);
-      res.end(JSON.stringify(results.map((r) => ({ result: r }))));
+      sendJson(req, res, JSON.stringify(results.map((r) => ({ result: r }))));
       return;
     }
 
@@ -180,8 +198,7 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       const result = await runCommand(parts);
-      res.writeHead(200);
-      res.end(JSON.stringify({ result }));
+      sendJson(req, res, JSON.stringify({ result }));
       return;
     }
 
@@ -196,8 +213,7 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       const result = await runCommand(parts);
-      res.writeHead(200);
-      res.end(JSON.stringify({ result }));
+      sendJson(req, res, JSON.stringify({ result }));
       return;
     }
 
