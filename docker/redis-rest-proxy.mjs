@@ -93,7 +93,10 @@ async function runCommand(args) {
   return client.sendCommand([cmd, ...cmdArgs.map(String)]);
 }
 
-const MAX_BODY_BYTES = 1024 * 1024; // 1 MB
+// Seeders publish up to 5 MB per key (MAX_PAYLOAD_BYTES in scripts/_seed-utils.mjs) and the
+// payload is JSON-escaped once more inside the command array, so give it headroom. The old 1 MB
+// cap made every seed-wildfires run die with ECONNRESET once FIRMS returned >~2k detections.
+const MAX_BODY_BYTES = 8 * 1024 * 1024; // 8 MB
 
 async function readBody(req) {
   const chunks = [];
