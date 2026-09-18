@@ -385,26 +385,26 @@ function createBroadcastPushDispatcher({ env, redis, translate, fetchImpl, log =
    * A send now claims a slot in each cohort it actually addresses — a
    * `low`-only story spends only `low`'s budget.
    *
-   * All-or-nothing: a partial claim is released before returning, so a story
-   * blocked on its last cohort leaves no slot consumed anywhere.
+   * A full cohort is DROPPED from the audience, not treated as a veto. It was
+   * all-or-nothing until 2026-09-18, which handed `low` a power no per-cohort
+   * budget was meant to give it: `low` sits in the audience of EVERY level, so
+   * the moment its quota ran out nothing could be broadcast at all. Measured
+   * that day — `low` 20/20 by 09:58 Istanbul, `medium` 2/20, `high` 0/20, and
+   * fourteen waking hours of silence while two thirds of the day's budget sat
+   * unspent. A story now reaches whichever cohorts still have room.
    *
-   * @returns {Promise<string[]|null>} claimed keys, or null with the cohort
-   *   that was full recorded in `fullCohort`.
+   * @returns {Promise<{byCohort:Map<string,string>, kept:string[], full:string[]}>}
    */
-  let fullCohort = null;
   async function claimCohortSlots(namespace, bucket, cap, cohorts, ttlSeconds) {
-    const keys = [];
+    const byCohort = new Map();
+    const full = [];
     for (const cohort of cohorts) {
       // eslint-disable-next-line no-await-in-loop -- at most three cohorts
       const key = await claimSlot(`${KEY_PREFIX}:${namespace}:${cohort}:${bucket}`, cap, ttlSeconds);
-      if (!key) {
-        fullCohort = cohort;
-        await release(keys);
-        return null;
-      }
-      keys.push(key);
+      if (key) byCohort.set(cohort, key);
+      else full.push(cohort);
     }
-    return keys;
+    return { byCohort, kept: [...byCohort.keys()], full };
   }
 
   /** Best-effort unwind; a failure here only costs one suppressed broadcast. */
@@ -596,7 +596,7 @@ function createBroadcastPushDispatcher({ env, redis, translate, fetchImpl, log =
       if (dedupResult === 'duplicate') return { action: 'suppressed', reason: 'already broadcast' };
       if (dedupResult !== 'new') return { action: 'suppressed', reason: `dedup unavailable (${dedupResult})` };
 
-      const claimed = [dedupKey];
+      let claimed = [dedupKey];
 
       // A rate limiter must DEFER a story, never consume it. Releasing the
       // dedup key on every rate-limited exit is what makes that true: the
@@ -632,13 +632,29 @@ function createBroadcastPushDispatcher({ env, redis, translate, fetchImpl, log =
         claimed.push(gapKey);
       }
 
-      const hourSlots = await claimCohortSlots('cap', hourBucket(now()), hourlyCap, audience, CAP_SLOT_TTL_S);
-      if (!hourSlots) return deferAndRelease(`hourly cap reached (${fullCohort})`);
-      claimed.push(...hourSlots);
+      const hourly = await claimCohortSlots('cap', hourBucket(now()), hourlyCap, audience, CAP_SLOT_TTL_S);
+      if (hourly.kept.length === 0) return deferAndRelease(`hourly cap reached (${hourly.full.join(',')})`);
+      claimed.push(...hourly.byCohort.values());
 
-      const daySlots = await claimCohortSlots('daycap', Math.floor(now() / 86_400_000), dailyCap, audience, DAILY_SLOT_TTL_S);
-      if (!daySlots) return deferAndRelease(`daily cap reached (${fullCohort})`);
-      claimed.push(...daySlots);
+      // Only the cohorts that cleared the hour are billed for the day; the
+      // rest are not receiving this story, so charging them would be a leak.
+      const daily = await claimCohortSlots('daycap', Math.floor(now() / 86_400_000), dailyCap, hourly.kept, DAILY_SLOT_TTL_S);
+      if (daily.kept.length === 0) return deferAndRelease(`daily cap reached (${daily.full.join(',')})`);
+      claimed.push(...daily.byCohort.values());
+
+      // An hourly slot held by a cohort the DAY then rejected is a slot that
+      // will never carry a message — hand it back so the next story can have it.
+      const strandedHourly = daily.full.map((cohort) => hourly.byCohort.get(cohort)).filter(Boolean);
+      if (strandedHourly.length) {
+        await release(strandedHourly);
+        claimed = claimed.filter((key) => !strandedHourly.includes(key));
+      }
+
+      const dropped = [...hourly.full, ...daily.full];
+      if (dropped.length) {
+        audience = daily.kept;
+        log.log?.(`[BroadcastPush] cohort(s) at cap, narrowed to [${audience.join(',')}] (dropped ${dropped.join(',')}): ${headline.slice(0, 60)}`);
+      }
 
       const body = await localizedBody(headline);
       const payload = buildBody({

@@ -960,14 +960,16 @@ describe('per-cohort budgets', () => {
     const third = await dispatcher.observe({ ...CRITICAL, level: 'high', title: 'Overnight three', sources: 1 });
     assert.equal(third.action, 'suppressed');
     assert.match(third.reason, /daily cap reached \(low\)/);
-    // A critical still reaches high + medium, whose budgets are untouched.
+    // The overnight run spent `low`'s budget and nobody else's.
+    const overnight = [...redis.store.keys()].filter((k) => k.includes(':daycap:'));
+    assert.equal(overnight.filter((k) => k.includes(':low:')).length, 2);
+    assert.equal(overnight.filter((k) => k.includes(':high:')).length, 0, 'high must not have been billed for low-only sends');
+    assert.equal(overnight.filter((k) => k.includes(':medium:')).length, 0);
+    // So a critical still reaches high + medium, whose budgets are untouched.
     const crit = await dispatcher.observe({ ...CRITICAL, title: 'Real crisis breaks' });
-    assert.equal(crit.action, 'suppressed', 'low is genuinely full, so this critical defers');
-    // ...but high and medium never spent a slot on the overnight run:
-    const spent = [...redis.store.keys()].filter((k) => k.includes(':daycap:'));
-    assert.equal(spent.filter((k) => k.includes(':low:')).length, 2);
-    assert.equal(spent.filter((k) => k.includes(':high:')).length, 0, 'high must not have been billed for low-only sends');
-    assert.equal(spent.filter((k) => k.includes(':medium:')).length, 0);
+    assert.equal(crit.action, 'sent', 'a full `low` must not veto the cohorts that still have room');
+    assert.deepEqual(crit.audience, ['high', 'medium']);
+    assert.deepEqual(fetchImpl.calls.at(-1).body.audience.priority, ['high', 'medium']);
   });
 
   it('a critical claims a slot in every cohort it addresses', async () => {
@@ -981,15 +983,44 @@ describe('per-cohort budgets', () => {
     }
   });
 
-  it('releases a partial claim when a later cohort is full — all-or-nothing', async () => {
+  it('drops the full cohort and sends to the rest, instead of vetoing the story', async () => {
+    const redis = fakeRedis();
+    const env = { BROADCAST_PUSH_MIN_GAP_S: '0', BROADCAST_PUSH_HOURLY_CAP: '10', BROADCAST_PUSH_DAILY_CAP: '1' };
+    const { dispatcher, fetchImpl } = makeDispatcher(env, { redis });
+    await dispatcher.observe({ ...CRITICAL, level: 'high', title: 'Fills low only', sources: 1 });
+    const sent = await dispatcher.observe({ ...CRITICAL, title: 'Critical past a full low' });
+    assert.equal(sent.action, 'sent');
+    assert.deepEqual(sent.audience, ['high', 'medium'], '`low` is full, the other two are not');
+    assert.deepEqual(fetchImpl.calls.at(-1).body.audience.priority, ['high', 'medium']);
+    // `low` was charged exactly once, by the story it actually received.
+    const lowDays = [...redis.store.keys()].filter((k) => k.includes(':daycap:low:'));
+    assert.equal(lowDays.length, 1);
+  });
+
+  it('hands back an hourly slot a cohort wins but then loses on the daily cap', async () => {
+    let clock = 1_800_000_000_000;
+    const redis = fakeRedis();
+    const env = { BROADCAST_PUSH_MIN_GAP_S: '0', BROADCAST_PUSH_HOURLY_CAP: '10', BROADCAST_PUSH_DAILY_CAP: '1' };
+    const { dispatcher } = makeDispatcher(env, { redis, now: () => clock });
+    await dispatcher.observe({ ...CRITICAL, level: 'high', title: 'Fills low only', sources: 1 });
+    clock += 3_600_000; // fresh hour bucket, same UTC day
+    const sent = await dispatcher.observe({ ...CRITICAL, title: 'Critical in the next hour' });
+    assert.equal(sent.action, 'sent');
+    assert.deepEqual(sent.audience, ['high', 'medium']);
+    const hour = Math.floor(clock / 3_600_000);
+    assert.equal(
+      redis.store.has(`wm:broadcast-push:v1:cap:low:${hour}:0`), false,
+      "low cleared the hour but not the day, so its hourly slot must not stay held",
+    );
+  });
+
+  it('suppresses only when EVERY addressed cohort is full', async () => {
     const redis = fakeRedis();
     const env = { BROADCAST_PUSH_MIN_GAP_S: '0', BROADCAST_PUSH_HOURLY_CAP: '10', BROADCAST_PUSH_DAILY_CAP: '1' };
     const { dispatcher } = makeDispatcher(env, { redis });
-    await dispatcher.observe({ ...CRITICAL, level: 'high', title: 'Fills low only', sources: 1 });
-    const before = [...redis.store.keys()].filter((k) => k.includes(':daycap:')).length;
-    const blocked = await dispatcher.observe({ ...CRITICAL, title: 'Critical blocked on low' });
+    await dispatcher.observe({ ...CRITICAL, title: 'Spends all three' });
+    const blocked = await dispatcher.observe({ ...CRITICAL, title: 'Nothing left anywhere' });
     assert.equal(blocked.action, 'suppressed');
-    const after = [...redis.store.keys()].filter((k) => k.includes(':daycap:')).length;
-    assert.equal(after, before, 'high and medium slots claimed before hitting full low must be released');
+    assert.match(blocked.reason, /daily cap reached \(high,medium,low\)/);
   });
 });
