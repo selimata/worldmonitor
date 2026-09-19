@@ -70,6 +70,15 @@ function fakeRedis({ failWith = null } = {}) {
       store.delete(key);
       return 1;
     },
+    async getJson(key) {
+      if (failWith) return { ok: false };
+      return { ok: true, value: store.has(key) ? store.get(key).value : null };
+    },
+    async setJson(key, value, ttl) {
+      if (failWith) return false;
+      store.set(key, { value, ttl });
+      return true;
+    },
   };
 }
 
@@ -122,6 +131,8 @@ function makeDispatcher(envOverrides = {}, deps = {}) {
 }
 
 const CRITICAL = { title: 'Major strike reported near the strait', level: 'critical', link: 'https://n.test/a', source: 'Reuters' };
+/** Routine flow: a corroborated `high`. Critical is exempt from the gap and hourly cap. */
+const ROUTINE = { ...CRITICAL, level: 'high', sources: 2 };
 
 // ── Audience mapping ──────────────────────────────────────────────────────────
 
@@ -291,8 +302,8 @@ describe('dedup', () => {
 describe('min-gap', () => {
   it('suppresses a second distinct story inside the window', async () => {
     const { dispatcher, fetchImpl } = makeDispatcher({ BROADCAST_PUSH_MIN_GAP_S: '900' });
-    assert.equal((await dispatcher.observe(CRITICAL)).action, 'sent');
-    const r = await dispatcher.observe({ ...CRITICAL, title: 'Second unrelated story' });
+    assert.equal((await dispatcher.observe(ROUTINE)).action, 'sent');
+    const r = await dispatcher.observe({ ...ROUTINE, title: 'Second unrelated story' });
     assert.equal(r.action, 'suppressed');
     assert.match(r.reason, /min-gap/);
     assert.equal(fetchImpl.calls.length, 1);
@@ -312,9 +323,9 @@ describe('hourly cap', () => {
       BROADCAST_PUSH_MIN_GAP_S: '0',
       BROADCAST_PUSH_HOURLY_CAP: '2',
     });
-    assert.equal((await dispatcher.observe({ ...CRITICAL, title: 'Story one' })).action, 'sent');
-    assert.equal((await dispatcher.observe({ ...CRITICAL, title: 'Story two' })).action, 'sent');
-    const third = await dispatcher.observe({ ...CRITICAL, title: 'Story three' });
+    assert.equal((await dispatcher.observe({ ...ROUTINE, title: 'Story one' })).action, 'sent');
+    assert.equal((await dispatcher.observe({ ...ROUTINE, title: 'Story two' })).action, 'sent');
+    const third = await dispatcher.observe({ ...ROUTINE, title: 'Story three' });
     assert.equal(third.action, 'suppressed');
     assert.match(third.reason, /hourly cap/);
     assert.equal(fetchImpl.calls.length, 2);
@@ -328,10 +339,10 @@ describe('hourly cap', () => {
       { BROADCAST_PUSH_MIN_GAP_S: '0', BROADCAST_PUSH_HOURLY_CAP: '1' },
       { redis, fetchImpl, now: () => clock },
     );
-    assert.equal((await dispatcher.observe({ ...CRITICAL, title: 'Story one' })).action, 'sent');
-    assert.equal((await dispatcher.observe({ ...CRITICAL, title: 'Story two' })).action, 'suppressed');
+    assert.equal((await dispatcher.observe({ ...ROUTINE, title: 'Story one' })).action, 'sent');
+    assert.equal((await dispatcher.observe({ ...ROUTINE, title: 'Story two' })).action, 'suppressed');
     clock += 3_600_000;
-    assert.equal((await dispatcher.observe({ ...CRITICAL, title: 'Story three' })).action, 'sent');
+    assert.equal((await dispatcher.observe({ ...ROUTINE, title: 'Story three' })).action, 'sent');
   });
 });
 
@@ -552,10 +563,10 @@ describe('failure handling', () => {
       { BROADCAST_PUSH_MIN_GAP_S: '900' },
       { redis, fetchImpl: fakeFetch({ throws: new Error('ECONNREFUSED') }) },
     );
-    const r = await dispatcher.observe(CRITICAL);
+    const r = await dispatcher.observe(ROUTINE);
     assert.equal(r.action, 'error');
-    // critical addresses three cohorts, so: dedup + gap + 3 hourly + 3 daily.
-    assert.equal(redis.deleted.length, 8, 'every per-cohort slot must be released too');
+    // a corroborated high addresses two cohorts, so: dedup + gap + 2 hourly + 2 daily.
+    assert.equal(redis.deleted.length, 6, 'every per-cohort slot must be released too');
     assert.ok(redis.deleted.some((k) => k.includes(':seen:')));
     assert.ok(redis.deleted.some((k) => k.endsWith(':gap')));
     assert.ok(redis.deleted.some((k) => k.includes(':cap:')));
@@ -651,7 +662,35 @@ describe('ais-relay.cjs wiring', () => {
   it('logs every drop — a silent no-op reads exactly like "no news today"', () => {
     const fn = aisRelaySrc.slice(aisRelaySrc.indexOf('function broadcastPushObserve'));
     assert.match(fn.slice(0, 2200), /skip stale/);
-    assert.match(fn.slice(0, 2200), /suppressed.*\|\|.*skipped|action === 'suppressed'/);
+    const flush = aisRelaySrc.slice(aisRelaySrc.indexOf('async function flushBroadcastCandidates'));
+    assert.match(flush.slice(0, 2200), /action === 'suppressed'/);
+  });
+
+  it('buffers instead of racing: the hook only collects, the flush decides', () => {
+    const fn = aisRelaySrc.slice(aisRelaySrc.indexOf('function broadcastPushObserve'));
+    const body = fn.slice(0, fn.indexOf('\n}\n'));
+    assert.match(body, /broadcastCandidates\.push\(/);
+    assert.doesNotMatch(body, /broadcastPushDispatcher\.observe\(/, 'arrival order must not pick the winner');
+  });
+
+  it('flushes after every variant pass, critical first, then newest first, one at a time', () => {
+    assert.match(aisRelaySrc, /await seedClassifyForVariant\(CLASSIFY_VARIANTS\[v\], seenTitles\);\s*\n\s*await flushBroadcastCandidates\(\);/);
+    const flush = aisRelaySrc.slice(aisRelaySrc.indexOf('async function flushBroadcastCandidates'));
+    assert.match(flush.slice(0, 2200), /BROADCAST_LEVEL_RANK\[b\.level\].*-.*BROADCAST_LEVEL_RANK\[a\.level\]/);
+    assert.match(flush.slice(0, 2200), /\(b\.publishedAt \?\? 0\) - \(a\.publishedAt \?\? 0\)/);
+    assert.match(flush.slice(0, 2200), /await broadcastPushDispatcher\.observe\(c\)/);
+  });
+
+  it('waits (bounded) for Live Activity verdicts so criticals are ranked too', () => {
+    assert.match(aisRelaySrc, /broadcastPendingVerdicts\.push\(la\.then/);
+    const flush = aisRelaySrc.slice(aisRelaySrc.indexOf('async function flushBroadcastCandidates'));
+    assert.match(flush.slice(0, 1400), /Promise\.race\(\[/);
+  });
+
+  it('wires a fail-closed JSON store for near-duplicate memory', () => {
+    assert.match(aisRelaySrc, /getJson: \(key\) =>/);
+    assert.match(aisRelaySrc, /failed \? \{ ok: false \}/);
+    assert.match(aisRelaySrc, /setJson: \(key, value, ttl\) => upstashSet\(key, value, ttl\)/);
   });
 });
 
@@ -918,13 +957,13 @@ describe('rate limits defer a story, never consume it', () => {
   it('releases the dedup key when the min-gap blocks, so the next sweep retries', async () => {
     const redis = fakeRedis();
     const { dispatcher, fetchImpl } = makeDispatcher({ BROADCAST_PUSH_MIN_GAP_S: '900' }, { redis });
-    await dispatcher.observe({ ...CRITICAL, title: 'Winner' });
-    const loser = await dispatcher.observe({ ...CRITICAL, title: 'Bigger story that lost the race' });
+    await dispatcher.observe({ ...ROUTINE, title: 'Winner' });
+    const loser = await dispatcher.observe({ ...ROUTINE, title: 'Bigger story that lost the race' });
     assert.equal(loser.action, 'suppressed');
     assert.match(loser.reason, /min-gap/);
     // Gap expires; the same story must be eligible again rather than "already broadcast".
     redis.store.delete('wm:broadcast-push:v1:gap');
-    const retry = await dispatcher.observe({ ...CRITICAL, title: 'Bigger story that lost the race' });
+    const retry = await dispatcher.observe({ ...ROUTINE, title: 'Bigger story that lost the race' });
     assert.equal(retry.action, 'sent', 'a story that never went out must not be burned for the dedup TTL');
     assert.equal(fetchImpl.calls.length, 2);
   });
@@ -1023,4 +1062,134 @@ describe('per-cohort budgets', () => {
     assert.equal(blocked.action, 'suppressed');
     assert.match(blocked.reason, /daily cap reached \(high,medium,low\)/);
   });
+});
+
+// ── Critical never waits behind the routine flow ──────────────────────────────
+
+describe('critical priority', () => {
+  it('is not held by the min-gap a routine story set', async () => {
+    const { dispatcher, fetchImpl } = makeDispatcher({ BROADCAST_PUSH_MIN_GAP_S: '1800' });
+    assert.equal((await dispatcher.observe({ ...ROUTINE, title: 'Routine story goes first' })).action, 'sent');
+    const crit = await dispatcher.observe({ ...CRITICAL, title: 'Missiles strike capital overnight' });
+    assert.equal(crit.action, 'sent');
+    assert.equal(fetchImpl.calls.length, 2);
+  });
+
+  it('still sets the gap when free, so routine stories keep their distance', async () => {
+    const { dispatcher } = makeDispatcher({ BROADCAST_PUSH_MIN_GAP_S: '1800' });
+    assert.equal((await dispatcher.observe(CRITICAL)).action, 'sent');
+    const routine = await dispatcher.observe({ ...ROUTINE, title: 'Parliament passes budget bill' });
+    assert.equal(routine.action, 'suppressed');
+    assert.match(routine.reason, /min-gap/);
+  });
+
+  it('is exempt from the hourly cap but bounded by the daily cap', async () => {
+    const { dispatcher } = makeDispatcher({
+      BROADCAST_PUSH_MIN_GAP_S: '0', BROADCAST_PUSH_HOURLY_CAP: '1', BROADCAST_PUSH_DAILY_CAP: '2',
+    });
+    assert.equal((await dispatcher.observe({ ...CRITICAL, title: 'Alpha event erupts in Kyiv' })).action, 'sent');
+    assert.equal((await dispatcher.observe({ ...CRITICAL, title: 'Bravo event erupts in Lagos' })).action, 'sent');
+    const third = await dispatcher.observe({ ...CRITICAL, title: 'Charlie event erupts in Lima' });
+    assert.equal(third.action, 'suppressed');
+    assert.match(third.reason, /daily cap/);
+  });
+});
+
+// ── Near-duplicate suppression ────────────────────────────────────────────────
+
+describe('near-duplicates never repeat', () => {
+  const env = { BROADCAST_PUSH_MIN_GAP_S: '0', BROADCAST_PUSH_HOURLY_CAP: '10', BROADCAST_PUSH_DAILY_CAP: '20' };
+
+  it('suppresses an outlet rewrite of a story already sent to the same cohorts', async () => {
+    const { dispatcher, fetchImpl } = makeDispatcher(env);
+    await dispatcher.observe({ ...ROUTINE, title: 'Trump bans media outlets CNN, MS NOW, Politico from White House' });
+    const rewrite = await dispatcher.observe({ ...ROUTINE, title: "Trump says he's banning CNN, Politico and MS NOW from the White House" });
+    assert.equal(rewrite.action, 'suppressed');
+    assert.match(rewrite.reason, /near-duplicate/);
+    assert.equal(fetchImpl.calls.length, 1);
+  });
+
+  it('a critical rewrite is suppressed too — priority does not buy a repeat', async () => {
+    const { dispatcher, fetchImpl } = makeDispatcher(env);
+    await dispatcher.observe({ ...CRITICAL, title: '2 ships attacked in Strait of Hormuz as tensions rise' });
+    const again = await dispatcher.observe({ ...CRITICAL, title: 'Two ships attacked in the Strait of Hormuz, tensions rise' });
+    assert.equal(again.action, 'suppressed');
+    assert.equal(fetchImpl.calls.length, 1);
+  });
+
+  it('a corroborated rewrite of a low-only story reaches only the cohorts that missed it', async () => {
+    const { dispatcher, fetchImpl } = makeDispatcher(env);
+    const first = await dispatcher.observe({ ...ROUTINE, sources: 1, title: 'Trump signs broad Russia sanctions bill' });
+    assert.deepEqual(first.audience, ['low']);
+    const corroborated = await dispatcher.observe({ ...ROUTINE, sources: 3, title: 'Trump signs Bill authorising sweeping Russia sanctions' });
+    assert.equal(corroborated.action, 'sent');
+    assert.deepEqual(corroborated.audience, ['medium'], '`low` already has it');
+    assert.deepEqual(fetchImpl.calls.at(-1).body.audience.priority, ['medium']);
+  });
+
+  it('keeps distinct events apart even when they share most words', async () => {
+    const { dispatcher, fetchImpl } = makeDispatcher(env);
+    await dispatcher.observe({ ...ROUTINE, title: 'Earthquake of magnitude 7.1 hits Japan' });
+    const other = await dispatcher.observe({ ...ROUTINE, title: 'Earthquake of magnitude 6.2 hits Turkey' });
+    assert.equal(other.action, 'sent');
+    assert.equal(fetchImpl.calls.length, 2);
+  });
+
+  it('forgets after the window', async () => {
+    let clock = 1_800_000_000_000;
+    const { dispatcher } = makeDispatcher(env, { now: () => clock });
+    await dispatcher.observe({ ...ROUTINE, title: 'Trump signs broad Russia sanctions bill' });
+    clock += 25 * 3_600_000;
+    const later = await dispatcher.observe({ ...ROUTINE, title: 'Trump signs Russia sanctions bill into law' });
+    assert.equal(later.action, 'sent');
+  });
+
+  it('releases every guard on a near-dup, so a later wider audience can still be reached', async () => {
+    const redis = fakeRedis();
+    const { dispatcher } = makeDispatcher({ ...env, BROADCAST_PUSH_MIN_GAP_S: '900' }, { redis });
+    await dispatcher.observe({ ...ROUTINE, title: 'Trump signs broad Russia sanctions bill' });
+    redis.store.delete('wm:broadcast-push:v1:gap');
+    await dispatcher.observe({ ...ROUTINE, title: 'Trump signs sweeping Russia sanctions bill' });
+    assert.equal(redis.store.has('wm:broadcast-push:v1:gap'), false, 'a suppressed rewrite must not hold the gap');
+    const seen = [...redis.store.keys()].filter((k) => k.includes(':seen:'));
+    assert.equal(seen.length, 1, 'only the story that went out keeps its dedup key');
+  });
+
+  it('fails closed when the store cannot be read', async () => {
+    const redis = fakeRedis();
+    redis.getJson = async () => ({ ok: false });
+    const { dispatcher, fetchImpl } = makeDispatcher(env, { redis });
+    const r = await dispatcher.observe(ROUTINE);
+    assert.equal(r.action, 'suppressed');
+    assert.match(r.reason, /store unavailable/);
+    assert.equal(fetchImpl.calls.length, 0);
+  });
+
+  it('does not record a story that never landed', async () => {
+    const redis = fakeRedis();
+    const { dispatcher } = makeDispatcher(env, { redis, fetchImpl: fakeFetch({ throws: new Error('ECONNREFUSED') }) });
+    await dispatcher.observe(ROUTINE);
+    assert.equal(redis.store.has('wm:broadcast-push:v1:recent'), false);
+  });
+});
+
+describe('sameStory — calibrated on the 2026-09-19 production log', () => {
+  const { headlineFingerprint: fp, sameStory } = require('../scripts/lib/broadcast-push.cjs');
+  const same = [
+    ['Trump bans media outlets CNN, MS NOW, Politico from White House', 'Trump bans CNN, MS NOW and Politico from White House'],
+    ['Urgent: Trump claims deal with Denmark, Greenland giving U.S. control', "Trump says Denmark to give US 'permanent control' over Greenland"],
+    ['Urgent: Trump claims deal with Denmark, Greenland giving U.S. control', 'US and Denmark reach deal over Greenland after Trump annexation threats'],
+    ['US troop deaths in Iran war exceed Pentagon count by at least 30', 'U.S. troop deaths during Iran war exceed Pentagon count by dozens'],
+    ['Trump signs broad Russia sanctions bill', 'Trump Signs Russia Sanctions Bill, Clears Way For 100% Tariffs'],
+    ['Kohat Police Lines attack: 8 terrorists killed', '8 terrorists killed in Kohat police lines attack'],
+  ];
+  const different = [
+    ['Earthquake of magnitude 7.1 hits Japan', 'Earthquake of magnitude 6.2 hits Turkey'],
+    ['Explosion kills 12 at market in Kabul', 'Explosion kills 9 at market in Lagos'],
+    ['Trump says tariffs on China will rise next month', 'Trump says Iran nuclear talks will resume'],
+    ['Russia strikes Kyiv overnight, 5 killed', 'Russia holds parliamentary vote in occupied areas'],
+    ['Saudi Arabia issues first air raid alerts for Riyadh', 'Ebola outbreak reaches new areas in Congo'],
+  ];
+  for (const [a, b] of same) it(`same: ${a.slice(0, 40)}…`, () => assert.ok(sameStory(fp(a), fp(b)) && sameStory(fp(b), fp(a))));
+  for (const [a, b] of different) it(`distinct: ${a.slice(0, 40)}…`, () => assert.ok(!sameStory(fp(a), fp(b)) && !sameStory(fp(b), fp(a))));
 });

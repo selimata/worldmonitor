@@ -44,8 +44,13 @@
  *                              only as a temporary volume brake; it overrides
  *                              the user's own priority choice while set.
  *   BROADCAST_PUSH_DEDUP_TTL_S default 21600 (6h)
- *   BROADCAST_PUSH_MIN_GAP_S   default 900 (15min between any two broadcasts)
- *   BROADCAST_PUSH_HOURLY_CAP  default 4
+ *   BROADCAST_PUSH_MIN_GAP_S   default 900 (15min between any two broadcasts);
+ *                              `critical` is never held by it, but still sets it
+ *   BROADCAST_PUSH_HOURLY_CAP  default 4; `critical` is exempt, the daily cap
+ *                              still bounds it
+ *   BROADCAST_PUSH_NEAR_DUP_WINDOW_S default 86400 — a headline that reads as
+ *                              a story already broadcast in this window only
+ *                              reaches cohorts that story did not reach
  *   BROADCAST_PUSH_DAILY_CAP   default 8
  *   BROADCAST_PUSH_MIN_SOURCES_HIGH  default 2 — an uncorroborated high
  *                              narrows to the `low` cohort instead of sending
@@ -247,6 +252,16 @@ const DEFAULT_DAILY_CAP = 8;
 /** A day bucket plus slack. */
 const DAILY_SLOT_TTL_S = 26 * 60 * 60;
 
+/**
+ * Near-duplicate memory. The exact-title dedup cannot see a rewrite: on
+ * 2026-09-18/19 eleven of twenty-nine broadcasts were the same five stories
+ * re-headlined by other outlets — the Greenland deal went out five times,
+ * "Trump bans CNN" four. The store remembers what went out, to whom, so a
+ * rewrite reaches only the cohorts the original did not.
+ */
+const DEFAULT_NEAR_DUP_WINDOW_S = 24 * 60 * 60;
+const RECENT_MAX_ENTRIES = 200;
+
 /** An hour bucket plus slack, so a slot key always outlives its own bucket. */
 const CAP_SLOT_TTL_S = 3900;
 
@@ -304,11 +319,77 @@ function hourBucket(nowMs) {
   return Math.floor(nowMs / 3_600_000);
 }
 
+// Words that carry no story identity. Headline boilerplate ("says", "live
+// updates") is in here too: two outlets framing one event differently share
+// the nouns, not the verbs of attribution.
+const FINGERPRINT_STOPWORDS = new Set((
+  'a an the and or but of to in on at by for from with into onto over under after before amid as is are was ' +
+  'were be been being has have had its it his her their this that these those says said say will would could ' +
+  'may might can new live update updates breaking news urgent report reports reported latest just more than ' +
+  'least about against during while who what when where why how not no yes via per up down out off us u s'
+).split(' '));
+const FINGERPRINT_LABEL = /^(?:breaking(?: news)?|urgent|live(?: updates?)?|updates?|just in|watch|exclusive|alert|flash)\s*[:|\-–—]\s*/i;
+
+/** Crude English stemmer — enough to make "bans"/"banning" and "gives"/"giving" meet. */
+function stemWord(word) {
+  let w = word;
+  if (w.length > 5 && w.endsWith('ing')) {
+    w = w.slice(0, -3);
+    if (/(.)\1$/.test(w)) w = w.slice(0, -1);
+  } else if (w.length > 4 && w.endsWith('ed')) {
+    w = w.slice(0, -2);
+    if (/(.)\1$/.test(w)) w = w.slice(0, -1);
+  } else if (w.length > 3 && w.endsWith('s') && !w.endsWith('ss')) {
+    w = w.slice(0, -1);
+  }
+  if (w.length > 3 && w.endsWith('e')) w = w.slice(0, -1);
+  return w;
+}
+
+/**
+ * @returns {{t:string[], n:string[]}} content words, and the proper nouns
+ *   among them (capitalised past the first word).
+ */
+function headlineFingerprint(title) {
+  const words = String(title ?? '')
+    .replace(FINGERPRINT_LABEL, '')
+    .replace(/['’]s\b/g, '')
+    .split(/[^\p{L}\p{N}]+/u)
+    .filter(Boolean);
+  const keep = (w) => w.length > 1 && !FINGERPRINT_STOPWORDS.has(w.toLowerCase());
+  const norm = (w) => stemWord(w.toLowerCase());
+  return {
+    t: [...new Set(words.filter(keep).map(norm))],
+    n: [...new Set(words.slice(1).filter((w) => keep(w) && /^\p{Lu}/u.test(w)).map(norm))],
+  };
+}
+
+/**
+ * Same story? At least three shared content words covering half the shorter
+ * headline — unless each side names something the other never mentions,
+ * which is how "quake hits Japan" stays apart from "quake hits Turkey".
+ * Calibrated on the 2026-09-19 log: all eleven rewrites caught, no distinct
+ * story merged.
+ */
+function sameStory(a, b) {
+  if (!a?.t?.length || !b?.t?.length) return false;
+  const bSet = new Set(b.t);
+  let shared = 0;
+  for (const w of a.t) if (bSet.has(w)) shared++;
+  if (shared < 3 || shared / Math.min(a.t.length, b.t.length) < 0.5) return false;
+  const aSet = new Set(a.t);
+  const aNamesUnseen = (a.n ?? []).some((w) => !bSet.has(w));
+  const bNamesUnseen = (b.n ?? []).some((w) => !aSet.has(w));
+  return !(aNamesUnseen && bNamesUnseen);
+}
+
 /**
  * @param {object} deps
  * @param {Record<string,string|undefined>} deps.env
  * @param {{setNx:(key:string,value:string,ttl:number)=>Promise<'new'|'duplicate'|'error'|'disabled'>,
- *          del:(key:string)=>Promise<unknown>}} deps.redis
+ *          del:(key:string)=>Promise<unknown>,
+ *          getJson:(key:string)=>Promise<{ok:boolean, value?:unknown}>,
+ *          setJson:(key:string,value:unknown,ttl:number)=>Promise<boolean>}} deps.redis
  * @param {(title:string,langs:string[])=>Promise<Record<string,string>>} [deps.translate]
  * @param {typeof fetch} [deps.fetchImpl]
  * @param {{log:Function,warn:Function}} [deps.log]
@@ -340,6 +421,7 @@ function createBroadcastPushDispatcher({ env, redis, translate, fetchImpl, log =
   const maxPages = envInt(env, 'BROADCAST_PUSH_MAX_PAGES', DEFAULT_MAX_PAGES, 1);
   const minSourcesHigh = envInt(env, 'BROADCAST_PUSH_MIN_SOURCES_HIGH', DEFAULT_MIN_SOURCES_HIGH, 1);
   const dailyCap = envInt(env, 'BROADCAST_PUSH_DAILY_CAP', DEFAULT_DAILY_CAP, 1);
+  const nearDupWindowS = envInt(env, 'BROADCAST_PUSH_NEAR_DUP_WINDOW_S', DEFAULT_NEAR_DUP_WINDOW_S, 60);
   const sandbox = String(env.APNS_ENVIRONMENT ?? '').toLowerCase() === 'sandbox';
   const i18n = envFlag(env, 'BROADCAST_PUSH_I18N');
   const langs = String(env.BROADCAST_PUSH_LANGS ?? '')
@@ -352,7 +434,7 @@ function createBroadcastPushDispatcher({ env, redis, translate, fetchImpl, log =
   const config = Object.freeze({
     enabled, armed, dryRun, sandbox, i18n, langs,
     baseUrl, minLevelRank, dedupTtlS, minGapS, hourlyCap, dailyCap, minSourcesHigh, audienceLimit, maxPages,
-    hasSecret: !!secret,
+    nearDupWindowS, hasSecret: !!secret,
   });
 
   /**
@@ -405,6 +487,25 @@ function createBroadcastPushDispatcher({ env, redis, translate, fetchImpl, log =
       else full.push(cohort);
     }
     return { byCohort, kept: [...byCohort.keys()], full };
+  }
+
+  const recentKey = `${KEY_PREFIX}:recent`;
+
+  /** Live entries in the near-dup window, or null when the store is unreadable. */
+  async function loadRecent() {
+    const res = await redis.getJson(recentKey);
+    if (!res?.ok) return null;
+    const cutoff = now() - nearDupWindowS * 1000;
+    return (Array.isArray(res.value) ? res.value : []).filter((e) => e && Number(e.at) >= cutoff);
+  }
+
+  /** Re-reads before appending so nothing written since the check is lost. */
+  async function rememberSent(fingerprint, audience, headline, fallback) {
+    const base = (await loadRecent()) ?? fallback;
+    const next = [...base, { f: fingerprint, a: [...audience], at: now(), h: headline.slice(0, 80) }]
+      .slice(-RECENT_MAX_ENTRIES);
+    const ok = await redis.setJson(recentKey, next, nearDupWindowS + 3600);
+    if (!ok) log.warn?.(`[BroadcastPush] could not record sent story — a rewrite of it may repeat: ${headline.slice(0, 60)}`);
   }
 
   /** Best-effort unwind; a failure here only costs one suppressed broadcast. */
@@ -623,16 +724,42 @@ function createBroadcastPushDispatcher({ env, redis, translate, fetchImpl, log =
         return { action: 'suppressed', reason };
       };
 
+      // A critical never waits behind the gap — it exists to space out the
+      // routine flow, not to hold back the story the whole surface is for.
+      // It still SETS the gap when free, so the routine flow keeps its
+      // distance from it.
+      const isCritical = level === 'critical';
       if (minGapS > 0) {
         const gapKey = `${KEY_PREFIX}:gap`;
         const gapResult = await redis.setNx(gapKey, hash, minGapS);
-        if (gapResult !== 'new') {
+        if (gapResult === 'new') {
+          claimed.push(gapKey);
+        } else if (!(isCritical && gapResult === 'duplicate')) {
           return deferAndRelease(gapResult === 'duplicate' ? 'inside min-gap window' : `gap unavailable (${gapResult})`);
         }
-        claimed.push(gapKey);
       }
 
-      const hourly = await claimCohortSlots('cap', hourBucket(now()), hourlyCap, audience, CAP_SLOT_TTL_S);
+      // Near-duplicates reach only the cohorts the earlier telling did not.
+      // Fails closed like every other guard here: an unreadable store could
+      // hide a repeat, and a repeat is what this exists to prevent.
+      const fingerprint = headlineFingerprint(alert?.title);
+      const recent = await loadRecent();
+      if (!recent) return deferAndRelease('recent-broadcast store unavailable');
+      const reached = new Set();
+      for (const entry of recent) {
+        if (sameStory(fingerprint, entry.f)) for (const cohort of entry.a ?? []) reached.add(cohort);
+      }
+      if (reached.size) {
+        const unreached = audience.filter((cohort) => !reached.has(cohort));
+        if (unreached.length === 0) return deferAndRelease('near-duplicate of a recent broadcast');
+        audience = unreached;
+      }
+
+      // Critical is exempt from the hourly cap for the same reason as the gap;
+      // the daily cap below still bounds a classifier that over-calls it.
+      const hourly = isCritical
+        ? { byCohort: new Map(), kept: [...audience], full: [] }
+        : await claimCohortSlots('cap', hourBucket(now()), hourlyCap, audience, CAP_SLOT_TTL_S);
       if (hourly.kept.length === 0) return deferAndRelease(`hourly cap reached (${hourly.full.join(',')})`);
       claimed.push(...hourly.byCohort.values());
 
@@ -668,6 +795,8 @@ function createBroadcastPushDispatcher({ env, redis, translate, fetchImpl, log =
       });
 
       const result = await pageThrough(payload);
+      // Any landed page means devices have it, so a rewrite must now respect it.
+      if (result.ok || result.pages > 0) await rememberSent(fingerprint, audience, headline, recent);
 
       if (!result.ok) {
         // Unwinding is only safe while NOTHING has gone out. Once a page has
@@ -723,6 +852,8 @@ module.exports = {
   normalizeHeadline,
   dedupHash,
   hourBucket,
+  headlineFingerprint,
+  sameStory,
   AUDIENCE_BY_LEVEL,
   LEVEL_RANK,
   TITLE_BY_LEVEL,

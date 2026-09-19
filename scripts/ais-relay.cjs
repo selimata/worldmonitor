@@ -38,7 +38,7 @@ const { createXPollCycle } = require('./lib/x-poll-cycle.cjs');
 const { createApnsLiveActivitySender } = require('./lib/apns-live-activity.cjs');
 const { createLiveActivityDispatcher, createUpstashCommandClient } = require('./lib/live-activity-dispatch.cjs');
 // Broadcast APNs alert to every registered iOS device — docs/broadcast-push.md.
-const { createBroadcastPushDispatcher } = require('./lib/broadcast-push.cjs');
+const { createBroadcastPushDispatcher, LEVEL_RANK: BROADCAST_LEVEL_RANK } = require('./lib/broadcast-push.cjs');
 // AI World Brief slot push — docs/broadcast-push.md.
 const { createBriefPushNotifier } = require('./lib/brief-push.cjs');
 const {
@@ -4287,6 +4287,7 @@ async function seedClassify() {
       if (v > 0) await new Promise((r) => setTimeout(r, CLASSIFY_VARIANT_STAGGER_MS));
       try {
         const stats = await seedClassifyForVariant(CLASSIFY_VARIANTS[v], seenTitles);
+        await flushBroadcastCandidates();
         totalClassified += stats.classified;
         totalSkipped += stats.skipped;
         console.log(`[Classify] ${CLASSIFY_VARIANTS[v]}: ${stats.total} titles, ${stats.classified} classified, ${stats.skipped} skipped`);
@@ -4513,7 +4514,9 @@ function observeCriticalSurfaces(title, meta, level, variant) {
     broadcastPushObserve(title, meta, level, variant);
     return;
   }
-  la.then((r) => {
+  // Tracked so flushBroadcastCandidates() can wait for the activity's
+  // verdict: a critical must be in the pool before the pool is ranked.
+  broadcastPendingVerdicts.push(la.then((r) => {
     const ceded = r && (
       r.action === 'started' ||
       r.action === 'updated' ||
@@ -4524,7 +4527,7 @@ function observeCriticalSurfaces(title, meta, level, variant) {
       return;
     }
     broadcastPushObserve(title, meta, level, variant);
-  }).catch(() => broadcastPushObserve(title, meta, level, variant));
+  }).catch(() => broadcastPushObserve(title, meta, level, variant)));
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -4550,6 +4553,13 @@ if (UPSTASH_ENABLED && process.env.BROADCAST_PUSH_ENABLED === '1') {
       redis: {
         setNx: (key, value, ttl) => upstashSetNx(key, value, ttl),
         del: (key) => upstashDel(key),
+        // upstashGet resolves null for both a miss and a failure; onFailure
+        // tells them apart, because the dispatcher must fail closed on one.
+        getJson: (key) => {
+          let failed = false;
+          return upstashGet(key, () => { failed = true; }).then((value) => (failed ? { ok: false } : { ok: true, value }));
+        },
+        setJson: (key, value, ttl) => upstashSet(key, value, ttl),
       },
       translate: liveActivityTranslate,
       log: console,
@@ -4596,20 +4606,74 @@ function broadcastPushObserve(title, meta, level, variant) {
       console.log(`[BroadcastPush] skip stale (${ageMin}min old, ${level}): ${String(title).slice(0, 80)}`);
       return;
     }
-    broadcastPushDispatcher.observe({
+    broadcastCandidates.push({
       title,
       level,
       link: meta?.link ?? '',
       source,
       sources: meta?.corroborationCount ?? 1,
       publishedAt,
-    }).then((r) => {
-      if (r?.action === 'suppressed' || r?.action === 'skipped') {
-        console.log(`[BroadcastPush] ${r.action} (${r.reason}): ${String(title).slice(0, 80)}`);
-      }
-    }).catch((e) => console.warn('[BroadcastPush] observe failed:', e?.message || e));
+    });
   } catch (e) {
     console.warn('[BroadcastPush] observe failed:', e?.message || e);
+  }
+}
+
+/**
+ * Candidates gathered during one variant's classify pass, ranked and offered
+ * to the dispatcher only once the pass is done.
+ *
+ * Offering them as they were met made arrival order the priority order, and
+ * arrival order is backwards: cached hits — stories already seen by an
+ * earlier sweep — are walked first, while the stories that just broke come
+ * out of the LLM batch last. The old story took the min-gap and the new one
+ * waited. Measured 2026-09-19: pushes landed 30–120 min after publication.
+ *
+ * Ranked critical before high, then newest first; offered strictly one at a
+ * time so the ranking — not a race between concurrent Redis calls — decides
+ * who gets the slot.
+ */
+const broadcastCandidates = [];
+const broadcastPendingVerdicts = [];
+const BROADCAST_VERDICT_WAIT_MS = 60_000;
+
+async function flushBroadcastCandidates() {
+  if (!broadcastPushDispatcher) {
+    broadcastCandidates.length = 0;
+    broadcastPendingVerdicts.length = 0;
+    return;
+  }
+  // Bounded: a verdict that misses the wait still lands in the pool, and the
+  // next flush (next variant, or next sweep) picks it up.
+  const verdicts = broadcastPendingVerdicts.splice(0);
+  if (verdicts.length) {
+    let timer;
+    await Promise.race([
+      Promise.allSettled(verdicts),
+      new Promise((r) => { timer = setTimeout(r, BROADCAST_VERDICT_WAIT_MS); }),
+    ]);
+    clearTimeout(timer);
+  }
+
+  const byTitle = new Map();
+  for (const c of broadcastCandidates.splice(0)) {
+    const prev = byTitle.get(c.title);
+    if (!prev || (BROADCAST_LEVEL_RANK[c.level] ?? 0) > (BROADCAST_LEVEL_RANK[prev.level] ?? 0)) byTitle.set(c.title, c);
+  }
+  const ranked = [...byTitle.values()].sort((a, b) =>
+    ((BROADCAST_LEVEL_RANK[b.level] ?? 0) - (BROADCAST_LEVEL_RANK[a.level] ?? 0)) ||
+    ((b.publishedAt ?? 0) - (a.publishedAt ?? 0)));
+
+  for (const c of ranked) {
+    try {
+      // eslint-disable-next-line no-await-in-loop -- sequential by design, see above
+      const r = await broadcastPushDispatcher.observe(c);
+      if (r?.action === 'suppressed' || r?.action === 'skipped') {
+        console.log(`[BroadcastPush] ${r.action} (${r.reason}): ${String(c.title).slice(0, 80)}`);
+      }
+    } catch (e) {
+      console.warn('[BroadcastPush] observe failed:', e?.message || e);
+    }
   }
 }
 
