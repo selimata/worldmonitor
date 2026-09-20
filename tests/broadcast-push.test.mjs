@@ -804,11 +804,12 @@ describe('variant scoping', () => {
 describe('one loud surface per critical', () => {
   it('cedes the banner when the activity owns the story, fires it when held', () => {
     const fn = aisRelaySrc.slice(aisRelaySrc.indexOf('function observeCriticalSurfaces'));
-    assert.match(fn.slice(0, 1400), /action === 'started'/);
-    assert.match(fn.slice(0, 1400), /action === 'updated'/);
+    assert.match(fn.slice(0, 2200), /action === 'started'/);
+    assert.match(fn.slice(0, 2200), /action === 'updated'/);
     assert.match(aisRelaySrc, /LA_CEDE_NOOP_REASONS = new Set\(\['already-started', 'no-new-reports'\]\)/);
-    assert.match(fn.slice(0, 1400), /ceded to live activity/);
-    assert.match(fn.slice(0, 1400), /\.catch\(\(\) => broadcastPushObserve/, 'an LA failure must not swallow the banner');
+    assert.match(fn.slice(0, 2200), /ceded to live activity/);
+    assert.match(fn.slice(0, 2200), /\.catch\(\(\) => broadcastPushObserve/, 'an LA failure must not swallow the banner');
+    assert.match(fn.slice(0, 2200), /no card for critical/, 'a decline must say why, or it reads as a dead card pipeline');
   });
 
   it('high stories keep their banner without touching the activity path', () => {

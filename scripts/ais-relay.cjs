@@ -3819,7 +3819,7 @@ Levels: critical, high, medium, low, info
 Categories: conflict, protest, disaster, diplomatic, economic, terrorism, cyber, health, environmental, military, crime, infrastructure, tech, general
 
 Guidelines for LEVEL assignment (geopolitical scope required for critical):
-- critical: Active military strikes with international implications, geopolitical mass-casualty events (10+ killed in conflict/terrorism/state action), ceasefire agreements/collapses, nuclear incidents, pandemic declarations, coups, strait/waterway closures
+- critical: Active military strikes with international implications, geopolitical mass-casualty events (10+ killed in conflict/terrorism/state action), ceasefire agreements/collapses, nuclear incidents, pandemic declarations, coups, strait/waterway closures, any strike or attack REACHING the capital or major metropolitan area of a nuclear-armed state (Moscow, Washington, Beijing, London, Paris, New Delhi, Islamabad, Pyongyang, Tel Aviv) — the casualty threshold does not apply there, the reach itself is the escalation
 - high: Armed conflict updates, major diplomatic actions, sanctions packages, significant natural disasters, blockades, terrorist attacks, domestic mass-casualty events (mass shootings, industrial disasters)
 - medium: Ongoing conflict analysis, economic impact reports, protest movements, regional policy changes, military exercises
 - low: Diplomatic meetings, trade discussions, humanitarian aid, election updates, peacekeeping deployments
@@ -3829,6 +3829,8 @@ Key distinction: "critical" requires GEOPOLITICAL scope — events that destabil
 - "8 children killed in mass shooting in Louisiana" → domestic mass-casualty, not geopolitical → high
 - "23 killed in fireworks factory explosion in India" → industrial accident → high
 - "700 killed in Sudan drone strikes" → geopolitical mass-casualty in active civil war → critical
+- "Two killed in massive Ukrainian drone attack on Moscow region" → strike reaching a nuclear power's capital → critical (low death toll is irrelevant here)
+- "Russian shelling kills 3 in eastern Ukraine border town" → routine frontline exchange, no capital reached → high
 - "Iran closes Strait of Hormuz" → global trade disruption → critical
 - "Guardian view on ceasefire: need real peace" → editorial → info
 - "Trump's obsession with energy" → opinion/analysis → info
@@ -4526,6 +4528,12 @@ function observeCriticalSurfaces(title, meta, level, variant) {
       console.log(`[BroadcastPush] ceded to live activity (${r.action}${r.reason ? ':' + r.reason : ''}): ${String(title).slice(0, 80)}`);
       return;
     }
+    // Why a critical did NOT raise a card is otherwise invisible: only the
+    // start-cooldown hold logs itself, so every other decline (too old to
+    // start, an activity already running) read as "the card machinery did
+    // nothing" — which is exactly the question asked of the 2026-09-20
+    // Moscow drone story.
+    console.log(`[LiveActivity] no card for critical (${r?.action ?? 'no-decision'}${r?.reason ? ':' + r.reason : ''}), banner fires instead: ${String(title).slice(0, 80)}`);
     broadcastPushObserve(title, meta, level, variant);
   }).catch(() => broadcastPushObserve(title, meta, level, variant)));
 }
