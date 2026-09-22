@@ -2619,17 +2619,22 @@ export const NUCLEAR_FACILITIES: NuclearFacility[] = [
   { id: 'valindaba', name: 'Valindaba', lat: -25.8, lon: 27.94, type: 'enrichment', status: 'active', operator: 'ZA' },
 ];
 
+// Tiers: severe = comprehensive embargo, high = broad sectoral sanctions,
+// moderate = targeted programmes (government, military or arms embargo).
+// Reviewed 2026-09: Syria dropped (comprehensive US programme ended 2025-07,
+// Caesar Act repealed 2025-12, SST designation rescinded 2026-08); Cuba added.
+
 // Used by Map.ts (2D SVG) which looks up countries via TopoJSON numeric IDs.
 // Keep in sync with SANCTIONED_COUNTRIES_ALPHA2 below.
 export const SANCTIONED_COUNTRIES: Record<number, 'severe' | 'high' | 'moderate'> = {
   408: 'severe',   // North Korea (KP)
-  728: 'severe',   // South Sudan (SS)
-  760: 'severe',   // Syria (SY)
-  364: 'high',     // Iran (IR)
+  364: 'severe',   // Iran (IR)
+  192: 'severe',   // Cuba (CU)
   643: 'high',     // Russia (RU)
   112: 'high',     // Belarus (BY)
   862: 'moderate', // Venezuela (VE)
   104: 'moderate', // Myanmar (MM)
+  728: 'moderate', // South Sudan (SS)
   178: 'moderate', // Congo DRC (CD)
 };
 
@@ -2637,13 +2642,13 @@ export const SANCTIONED_COUNTRIES: Record<number, 'severe' | 'high' | 'moderate'
 // Keep in sync with SANCTIONED_COUNTRIES above.
 export const SANCTIONED_COUNTRIES_ALPHA2: Record<string, 'severe' | 'high' | 'moderate'> = {
   KP: 'severe', // North Korea (408)
-  SS: 'severe', // South Sudan (728)
-  SY: 'severe', // Syria (760)
-  IR: 'high',   // Iran (364)
+  IR: 'severe', // Iran (364)
+  CU: 'severe', // Cuba (192)
   RU: 'high',   // Russia (643)
   BY: 'high',   // Belarus (112)
   VE: 'moderate', // Venezuela (862)
   MM: 'moderate', // Myanmar (104)
+  SS: 'moderate', // South Sudan (728)
   CD: 'moderate', // Congo DRC (178)
 };
 

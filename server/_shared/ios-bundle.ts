@@ -22,6 +22,7 @@ import {
   CRITICAL_MINERALS,
   ECONOMIC_CENTERS,
   NUCLEAR_FACILITIES,
+  SANCTIONED_COUNTRIES_ALPHA2,
   SPACEPORTS,
   UNDERSEA_CABLES,
 } from '../../src/config/geo-map';
@@ -439,6 +440,9 @@ function buildBundle() {
     economicHubs: buildEconomicHubs(),
     spaceports: buildSpaceports(),
     criticalMinerals: buildCriticalMinerals(),
+    // ISO 3166-1 alpha-2 → 'severe' | 'high' | 'moderate', the web map's
+    // sanctions choropleth as-is.
+    sanctionedCountries: SANCTIONED_COUNTRIES_ALPHA2,
     aptGroups: buildAptGroups(),
     militaryBases: buildMilitaryBases(),
     pipelines: buildPipelines(),
