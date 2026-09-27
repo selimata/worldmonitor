@@ -4,9 +4,9 @@
 # Runs scripts/seed-pizzint.mjs as a Railway cron. Publishes
 # `intelligence:pizzint:seed:v1`, which
 # server/worldmonitor/intelligence/v1/get-pizzint-status.ts is the only reader
-# of — when that key is absent the handler drops the whole `pizzint` field and
-# answers `{"tensionPairs":[]}`, which looks like a healthy empty result rather
-# than missing data.
+# of — when that key is absent the handler answers a no-store DEFCON-5 baseline
+# with no locations, which looks like a quiet reading rather than missing data.
+# Only /api/health (which reads the key directly) shows the gap.
 #
 # Cadence: run on `*/10 * * * *`. api/health.js pins pizzint at maxStaleMin 30
 # (3x the relay's 10-min loop) and the payload TTL is 30 min, so a slower
