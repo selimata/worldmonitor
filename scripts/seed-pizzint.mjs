@@ -26,6 +26,13 @@ const CACHE_TTL = 1800; // 30 min — mirrors PIZZINT_SEED_TTL in ais-relay.cjs
 const PIZZINT_API = 'https://www.pizzint.watch/api/dashboard-data';
 const GDELT_BATCH_API = 'https://www.pizzint.watch/api/gdelt/batch';
 const DEFAULT_GDELT_PAIRS = 'usa_russia,russia_ukraine,usa_china,china_taiwan,usa_iran,usa_venezuela';
+// gdelt/batch rejects requests without dateStart/dateEnd (YYYYMMDD). Same
+// 30-day window as the relay's GDELT_WINDOW_MS.
+const GDELT_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
+
+function gdeltYmd(d) {
+  return d.toISOString().slice(0, 10).replace(/-/g, '');
+}
 
 function projectLocations(rows) {
   return rows.map((d) => ({
@@ -72,7 +79,9 @@ function deriveDefcon(locations, openLocations, activeSpikes) {
 // upstream GDELT outage must not fail the whole seed.
 async function fetchTensionPairs() {
   try {
-    const url = `${GDELT_BATCH_API}?pairs=${encodeURIComponent(DEFAULT_GDELT_PAIRS)}&method=gpr`;
+    const now = new Date();
+    const url = `${GDELT_BATCH_API}?pairs=${encodeURIComponent(DEFAULT_GDELT_PAIRS)}&method=gpr`
+      + `&dateStart=${gdeltYmd(new Date(now.getTime() - GDELT_WINDOW_MS))}&dateEnd=${gdeltYmd(now)}`;
     const resp = await fetch(url, {
       headers: { Accept: 'application/json', 'User-Agent': CHROME_UA },
       signal: AbortSignal.timeout(15_000),

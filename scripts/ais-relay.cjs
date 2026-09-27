@@ -7536,6 +7536,7 @@ const PIZZINT_REDIS_KEY = 'intelligence:pizzint:seed:v1';
 const PIZZINT_API = 'https://www.pizzint.watch/api/dashboard-data';
 const GDELT_BATCH_API = 'https://www.pizzint.watch/api/gdelt/batch';
 const DEFAULT_GDELT_PAIRS = 'usa_russia,russia_ukraine,usa_china,china_taiwan,usa_iran,usa_venezuela';
+const GDELT_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
 let pizzintSeedInFlight = false;
 
 async function seedPizzint() {
@@ -7552,8 +7553,10 @@ async function seedPizzint() {
       return;
     }
     const raw = await resp.json();
-    if (!raw.success || !Array.isArray(raw.data)) {
-      console.warn('[PizzINT] No data in API response');
+    if (!raw.success || !Array.isArray(raw.data) || raw.data.length === 0) {
+      const reason = !raw.success ? 'unsuccessful_response'
+        : !Array.isArray(raw.data) ? 'non_array_data' : 'empty_array';
+      console.warn(`[PizzINT] No data in API response (${reason}); preserving last good observation`);
       return;
     }
 
@@ -7606,11 +7609,15 @@ async function seedPizzint() {
     // Fetch GDELT tensions (non-fatal if unavailable)
     let tensionPairs = [];
     try {
-      const gdeltUrl = `${GDELT_BATCH_API}?pairs=${encodeURIComponent(DEFAULT_GDELT_PAIRS)}&method=gpr`;
+      // The endpoint requires a YYYYMMDD window and 400s without one.
+      const gdeltDate = (ms) => new Date(ms).toISOString().slice(0, 10).replace(/-/g, '');
+      const gdeltUrl = `${GDELT_BATCH_API}?pairs=${encodeURIComponent(DEFAULT_GDELT_PAIRS)}&method=gpr`
+        + `&dateStart=${gdeltDate(Date.now() - GDELT_WINDOW_MS)}&dateEnd=${gdeltDate(Date.now())}`;
       const gdeltResp = await fetch(gdeltUrl, {
         headers: { Accept: 'application/json', 'User-Agent': CHROME_UA },
         signal: AbortSignal.timeout(15_000),
       });
+      if (!gdeltResp.ok) console.warn(`[PizzINT] GDELT tensions request rejected (HTTP ${Number(gdeltResp.status) || 0})`);
       if (gdeltResp.ok) {
         const gdeltRaw = await gdeltResp.json();
         tensionPairs = Object.entries(gdeltRaw).map(([pairKey, dataPoints]) => {
@@ -7634,7 +7641,7 @@ async function seedPizzint() {
 
     const payload = { pizzint, tensionPairs };
     const ok1 = await envelopeWrite(PIZZINT_REDIS_KEY, payload, PIZZINT_SEED_TTL, { recordCount: locations.length, sourceVersion: 'pizzint' });
-    const ok2 = await upstashSet('seed-meta:intelligence:pizzint', { fetchedAt: Date.now(), recordCount: locations.length }, 604800);
+    const ok2 = ok1 && await upstashSet('seed-meta:intelligence:pizzint', { fetchedAt: Date.now(), recordCount: locations.length }, 604800);
     console.log(`[PizzINT] Seeded ${locations.length} locations (open:${openLocations.length} spikes:${activeSpikes} defcon:${defconLevel} gdelt:${tensionPairs.length} redis:${ok1 && ok2 ? 'OK' : 'PARTIAL'}) in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
   } catch (e) {
     console.warn('[PizzINT] Seed error:', e?.message || e);
