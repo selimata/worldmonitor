@@ -776,6 +776,13 @@ describe('deploy/cache configuration guardrails', () => {
     );
   });
 
+  it('lets the iOS country outlines refresh daily inside the immutable /data tree', () => {
+    // The iOS app revalidates this file once a day by ETag; it keeps its name
+    // across updates, so the year-long /data rule must not reach it.
+    assert.equal(effectiveCacheControl('/data/country-boundaries.json'), 'public, max-age=86400');
+    assert.equal(effectiveCacheControl('/data/countries.geojson'), 'public, max-age=31536000, immutable');
+  });
+
   it('keeps PWA precache glob free of HTML files', () => {
     assert.match(
       viteConfigSource,
