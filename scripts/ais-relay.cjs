@@ -4526,6 +4526,13 @@ function observeCriticalSurfaces(title, meta, level, variant) {
     );
     if (ceded) {
       console.log(`[BroadcastPush] ceded to live activity (${r.action}${r.reason ? ':' + r.reason : ''}): ${String(title).slice(0, 80)}`);
+      // The banner it replaced would have been listed in the app and on the
+      // Discover ticker; the activity is not, unless recorded here. Only on
+      // the start: updates and noops are the same story again. Not awaited:
+      // the banner pool must not wait on the headline's translation.
+      if (r.action === 'started' && broadcastPushDispatcher) {
+        void broadcastPushDispatcher.recordLiveActivity({ title, link: meta?.link ?? '', source: meta?.source ?? '' });
+      }
       return;
     }
     // Why a critical did NOT raise a card is otherwise invisible: only the

@@ -39,7 +39,7 @@ const {
 const seedInsightsSrc = readFileSync(resolve(__dirname, '..', 'scripts', 'seed-insights.mjs'), 'utf-8');
 const sendEndpointSrc = (() => {
   try {
-    return readFileSync(resolve(__dirname, '..', '..', 'monitor-landing-web', 'pages', 'api', 'push', 'send.ts'), 'utf-8');
+    return readFileSync(resolve(__dirname, '..', '..', 'monitor-landing-web', 'lib', 'push', 'send.ts'), 'utf-8');
   } catch { return null; }
 })();
 const xcstrings = (() => {

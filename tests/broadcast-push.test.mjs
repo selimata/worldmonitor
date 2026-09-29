@@ -33,12 +33,15 @@ const {
 } = require('../scripts/lib/broadcast-push.cjs');
 
 const aisRelaySrc = readFileSync(resolve(__dirname, '..', 'scripts', 'ais-relay.cjs'), 'utf-8');
+// The send endpoint is a thin page over lib/push/send.ts (shared with the admin
+// panel), lib/push/bearer.ts (shared with /api/push/record) and the audience
+// filter in lib/notificationInbox.ts; the contract holds for them together.
 const sendEndpointSrc = (() => {
   try {
-    return readFileSync(
-      resolve(__dirname, '..', '..', 'monitor-landing-web', 'pages', 'api', 'push', 'send.ts'),
-      'utf-8',
-    );
+    const landing = resolve(__dirname, '..', '..', 'monitor-landing-web');
+    return ['pages/api/push/send.ts', 'lib/push/send.ts', 'lib/push/bearer.ts', 'lib/notificationInbox.ts']
+      .map((file) => readFileSync(resolve(landing, file), 'utf-8'))
+      .join('\n');
   } catch {
     return null; // sibling repo not checked out — those tests self-skip
   }
@@ -1193,4 +1196,37 @@ describe('sameStory — calibrated on the 2026-09-19 production log', () => {
   ];
   for (const [a, b] of same) it(`same: ${a.slice(0, 40)}…`, () => assert.ok(sameStory(fp(a), fp(b)) && sameStory(fp(b), fp(a))));
   for (const [a, b] of different) it(`distinct: ${a.slice(0, 40)}…`, () => assert.ok(!sameStory(fp(a), fp(b)) && !sameStory(fp(b), fp(a))));
+});
+
+describe('recordLiveActivity — list a card-carried critical without pushing it', () => {
+  it('posts the ceded banner\'s content to the record endpoint only, once', async () => {
+    const fetchImpl = fakeFetch({ json: { nid: 'n1' } });
+    const { dispatcher } = makeDispatcher({}, { fetchImpl });
+    const result = await dispatcher.recordLiveActivity(CRITICAL);
+    assert.deepEqual(result, { action: 'recorded', nid: 'n1' });
+    assert.equal(fetchImpl.calls.length, 1);
+    const [{ url, body }] = fetchImpl.calls;
+    assert.equal(url, 'https://example.test/api/push/record');
+    assert.deepEqual(Object.keys(body).sort(), ['alert', 'audience', 'route']);
+    assert.equal(body.alert.title.en, 'WORLD ALERT');
+    assert.equal(body.alert.body, CRITICAL.title);
+    assert.equal(body.alert.subtitle, 'Reuters');
+    assert.deepEqual(body.audience.priority, ['high', 'medium', 'low']);
+    assert.equal(body.audience.includeUnsetPriority, true);
+    assert.deepEqual(body.route, { type: 'article', url: CRITICAL.link, title: CRITICAL.title });
+    // No broadcast guard is touched: the story still has its dedup, gap and caps.
+    assert.equal((await dispatcher.observe(CRITICAL)).action, 'sent');
+  });
+
+  it('does nothing in dry-run or when disabled, and never throws', async () => {
+    const dry = makeDispatcher({ BROADCAST_PUSH_DRY_RUN: '1' });
+    assert.equal((await dry.dispatcher.recordLiveActivity(CRITICAL)).action, 'dry-run');
+    assert.equal(dry.fetchImpl.calls.length, 0);
+    const off = makeDispatcher({ BROADCAST_PUSH_ENABLED: '0' });
+    assert.equal((await off.dispatcher.recordLiveActivity(CRITICAL)).action, 'disabled');
+    const down = makeDispatcher({}, { fetchImpl: fakeFetch({ throws: new Error('net down') }) });
+    assert.equal((await down.dispatcher.recordLiveActivity(CRITICAL)).action, 'error');
+    const missing = makeDispatcher({}, { fetchImpl: fakeFetch({ status: 404 }) });
+    assert.deepEqual(await missing.dispatcher.recordLiveActivity(CRITICAL), { action: 'error', status: 404 });
+  });
 });

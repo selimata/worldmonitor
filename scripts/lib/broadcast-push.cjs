@@ -230,6 +230,8 @@ const BODY_MAX_CHARS = 220;
 const REQUEST_TIMEOUT_MS = 30_000;
 const DEFAULT_BASE_URL = 'https://world-monitor-app.vercel.app';
 const SEND_PATH = '/api/push/send';
+/** Lists without pushing — pages/api/push/record.ts. */
+const RECORD_PATH = '/api/push/record';
 const KEY_PREFIX = 'wm:broadcast-push:v1';
 
 const DEFAULT_DEDUP_TTL_S = 6 * 60 * 60;
@@ -576,11 +578,11 @@ function createBroadcastPushDispatcher({ env, redis, translate, fetchImpl, log =
     };
   }
 
-  async function post(payload) {
+  async function post(payload, path = SEND_PATH) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
     try {
-      const res = await doFetch(`${baseUrl}${SEND_PATH}`, {
+      const res = await doFetch(`${baseUrl}${path}`, {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${secret}`,
@@ -843,7 +845,50 @@ function createBroadcastPushDispatcher({ env, redis, translate, fetchImpl, log =
     }
   }
 
-  return { observe, config };
+  /**
+   * List a critical story that a Live Activity announced, without pushing it.
+   *
+   * The activity start goes to APNs straight from the relay, so the story
+   * never passes through the send endpoint and was missing from the in-app
+   * notification list and the Discover ticker (which reads only `high`
+   * sends): on 2026-09-29 all five criticals started cards and the ticker
+   * stayed empty all day. Recorded exactly as the ceded banner would have
+   * been — same title, body, route and audience — so the list reads the
+   * same whichever surface carried the story. Best effort: a failure here
+   * only costs the list row, never the activity.
+   *
+   * @param {{title:string, link?:string, source?:string}} alert
+   * @returns {Promise<{action:string, reason?:string, nid?:string}>}
+   */
+  async function recordLiveActivity(alert) {
+    try {
+      if (!enabled) return { action: 'disabled' };
+      if (dryRun) return { action: 'dry-run' };
+      const headline = normalizeHeadline(alert?.title);
+      if (!headline) return { action: 'skipped', reason: 'empty title' };
+      const payload = buildBody({
+        level: 'critical',
+        audience: audienceForLevel('critical'),
+        headline,
+        body: await localizedBody(headline),
+        link: alert?.link ?? '',
+        source: alert?.source ?? '',
+        hash: dedupHash(alert?.title),
+      });
+      const result = await post({ alert: payload.alert, route: payload.route, audience: payload.audience }, RECORD_PATH);
+      if (result.status !== 200) {
+        log.warn?.(`[BroadcastPush] live-activity list row failed (HTTP ${result.status}): ${headline.slice(0, 60)}`);
+        return { action: 'error', status: result.status };
+      }
+      log.log?.(`[BroadcastPush] listed live-activity story (no push): ${headline.slice(0, 60)}`);
+      return { action: 'recorded', nid: result.json?.nid };
+    } catch (e) {
+      log.warn?.(`[BroadcastPush] live-activity list row failed: ${e?.message || e}`);
+      return { action: 'error', reason: e?.message || String(e) };
+    }
+  }
+
+  return { observe, recordLiveActivity, config };
 }
 
 module.exports = {
