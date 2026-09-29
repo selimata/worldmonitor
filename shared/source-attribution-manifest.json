@@ -6936,6 +6936,23 @@
       ]
     },
     {
+      "host": "pentagonpizzaalert.com",
+      "provider": "pentagonpizzaalert.com",
+      "kind": "structured",
+      "observed": true,
+      "license": "Provider terms for this upstream API/dataset; verify before redistribution",
+      "attribution": "Credit pentagonpizzaalert.com and link to the original upstream API/dataset.",
+      "status": "terms-review",
+      "references": [
+        {
+          "path": "scripts/ais-relay.cjs"
+        },
+        {
+          "path": "scripts/seed-pizzint.mjs"
+        }
+      ]
+    },
+    {
       "host": "phys.org",
       "provider": "phys.org",
       "kind": "structured",
