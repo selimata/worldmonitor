@@ -52,6 +52,12 @@ function projectLocations(rows) {
   }));
 }
 
+const DEFCON_LABELS = { 1: 'Maximum Activity', 2: 'High Activity', 3: 'Elevated Activity', 4: 'Above Normal', 5: 'Normal Activity' };
+function defconBand(score) {
+  const defconLevel = score >= 85 ? 1 : score >= 70 ? 2 : score >= 50 ? 3 : score >= 25 ? 4 : 5;
+  return { defconLevel, defconLabel: DEFCON_LABELS[defconLevel] };
+}
+
 // Activity is averaged over OPEN locations only — a closed store reports 0
 // popularity and would otherwise drag the index down overnight. Spikes add a
 // flat bonus per spiking location before the DEFCON banding.
@@ -64,13 +70,7 @@ function deriveDefcon(locations, openLocations, activeSpikes) {
   if (activeSpikes > 0) adjusted += activeSpikes * 10;
   adjusted = Math.min(100, adjusted);
 
-  let defconLevel = 5;
-  let defconLabel = 'Normal Activity';
-  if (adjusted >= 85) { defconLevel = 1; defconLabel = 'Maximum Activity'; }
-  else if (adjusted >= 70) { defconLevel = 2; defconLabel = 'High Activity'; }
-  else if (adjusted >= 50) { defconLevel = 3; defconLabel = 'Elevated Activity'; }
-  else if (adjusted >= 25) { defconLevel = 4; defconLabel = 'Above Normal'; }
-
+  const { defconLevel, defconLabel } = defconBand(adjusted);
   return { defconLevel, defconLabel, aggregateActivity: Math.round(avgPop) };
 }
 
@@ -111,16 +111,113 @@ async function fetchTensionPairs() {
   }
 }
 
-async function fetchPizzint() {
-  const resp = await fetch(PIZZINT_API, {
-    headers: { Accept: 'application/json', 'User-Agent': CHROME_UA },
+// ─────────────────────────────────────────────────────────────
+// PizzINT fallback — pentagonpizzaalert.com
+// Free, public, no login/API key. Used only when pizzint.watch has no usable
+// reading (down, Supabase outage, or an empty data array — observed
+// 2026-09-29). Its homepage is server-rendered with the data as plain HTML
+// and its robots.txt allows all bots, ClaudeBot included. One GET per run.
+//
+// Per-venue address/lat/lng are a static table, crawled once on 2026-09-29
+// from each venue's own page (schema.org GeoCoordinates) — the 11 Pentagon-
+// area venues don't move; re-crawl only if pentagonpizzaalert.com adds,
+// removes, or renames one. Keep this table in step with the copy in
+// scripts/ais-relay.cjs (seedPizzint).
+// ─────────────────────────────────────────────────────────────
+const PENTAGON_PIZZA_ALERT_URL = 'https://pentagonpizzaalert.com/';
+const PENTAGON_PIZZA_ALERT_VENUES = {
+  'district-pizza-palace': { address: '2325 S Eads St, Arlington, VA', lat: 38.8527414, lng: -77.0531408 },
+  'pizza-hut': { address: '1049 W Glebe Rd, Arlington, VA', lat: 38.8430983, lng: -77.0762855 },
+  'pizzato-pizza': { address: '2626 N Pershing Dr, Arlington, VA', lat: 38.8806865, lng: -77.089827 },
+  'crystal-city-sports-pub': { address: '529 23rd St S, Arlington, VA', lat: 38.8535379, lng: -77.0543326 },
+  'nighthawk-brewery-pizza': { address: '4225 S 28th St, Arlington, VA', lat: 38.8631637, lng: -77.0624806 },
+  'extreme-pizza': { address: '1419 S Fern St, Arlington, VA', lat: 38.8602396, lng: -77.0559854 },
+  'papa-johns': { address: '2440 Wilson Blvd, Arlington, VA 22201', lat: 38.8903112, lng: -77.0883773 },
+  'freddies-beach-bar': { address: '555 23rd St S, Arlington, VA', lat: 38.8535485, lng: -77.0549009 },
+  'wiseguy-pizza': { address: '710 12th St S, Arlington, VA 22202', lat: 38.862657, lng: -77.0588418 },
+  'we-the-pizza': { address: '2100 Crystal Dr, Arlington, VA', lat: 38.8551791, lng: -77.049733 },
+  'dominos-pizza': { address: '3535 S Ball St, Arlington, VA', lat: 38.8430908, lng: -77.0507832 },
+};
+const PPA_LEVEL_TO_DEFCON = { CRITICAL: 1, HIGH: 2, ELEVATED: 3, GUARDED: 4, NORMAL: 5 };
+const PPA_LEVEL_RE = /<h2[^>]*>(CRITICAL|HIGH|ELEVATED|GUARDED|NORMAL)<\/h2>/;
+const PPA_COMPOSITE_RE = /Composite<\/div><div class="fig[^"]*"[^>]*>(\d+)<\/div>/;
+const PPA_VENUE_RE = /aria-label="([^"]+), (\d+) percent, ([A-Z ]+)"[^>]*href="\/locations\/([a-z0-9-]+)"/g;
+
+function decodePpaEntities(s) {
+  return s.replace(/&amp;/g, '&').replace(/&#x27;/g, "'").replace(/&quot;/g, '"').replace(/&#39;/g, "'");
+}
+
+async function fetchPentagonPizzaAlert() {
+  const resp = await fetch(PENTAGON_PIZZA_ALERT_URL, {
+    headers: { Accept: 'text/html', 'User-Agent': CHROME_UA },
     signal: AbortSignal.timeout(15_000),
   });
-  if (!resp.ok) throw new Error(`pizzint.watch HTTP ${resp.status}`);
+  if (!resp.ok) throw new Error(`pentagonpizzaalert.com HTTP ${resp.status}`);
+  const html = await resp.text();
 
-  const raw = await resp.json();
-  if (!raw.success || !Array.isArray(raw.data)) {
-    throw new Error('pizzint.watch returned no data array');
+  const levelMatch = html.match(PPA_LEVEL_RE);
+  const compositeMatch = html.match(PPA_COMPOSITE_RE);
+  const venueMatches = [...html.matchAll(PPA_VENUE_RE)];
+  if (!levelMatch || !compositeMatch || venueMatches.length === 0) {
+    throw new Error('pentagonpizzaalert.com markup did not match (possible site redesign)');
+  }
+
+  const recordedAt = new Date().toISOString();
+  const locations = venueMatches.map(([, rawName, percentStr, rawState, slug]) => {
+    const meta = PENTAGON_PIZZA_ALERT_VENUES[slug] || {};
+    const state = rawState.trim();
+    return {
+      placeId: '',
+      name: decodePpaEntities(rawName),
+      address: meta.address || '',
+      currentPopularity: Number(percentStr),
+      percentageOfUsual: 0, // not published on the homepage
+      isSpike: state === 'VERY BUSY', // pentagonpizzaalert.com's own threshold
+      spikeMagnitude: 0, // not published on the homepage
+      dataSource: 'pentagonpizzaalert.com',
+      recordedAt,
+      dataFreshness: 'DATA_FRESHNESS_FRESH',
+      isClosedNow: state === 'CLOSED',
+      lat: meta.lat ?? 0,
+      lng: meta.lng ?? 0,
+    };
+  });
+
+  const defconLevel = PPA_LEVEL_TO_DEFCON[levelMatch[1]] || 5;
+  return {
+    pizzint: {
+      defconLevel,
+      defconLabel: DEFCON_LABELS[defconLevel] || 'Normal Activity',
+      aggregateActivity: Number(compositeMatch[1]),
+      activeSpikes: locations.filter((l) => l.isSpike).length,
+      locationsMonitored: locations.length,
+      locationsOpen: locations.filter((l) => !l.isClosedNow).length,
+      updatedAt: Date.now(),
+      dataFreshness: 'DATA_FRESHNESS_FRESH',
+      locations,
+    },
+    tensionPairs: await fetchTensionPairs(),
+  };
+}
+
+async function fetchPizzint() {
+  let raw = null;
+  try {
+    const resp = await fetch(PIZZINT_API, {
+      headers: { Accept: 'application/json', 'User-Agent': CHROME_UA },
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (resp.ok) {
+      const body = await resp.json();
+      if (body.success && Array.isArray(body.data) && body.data.length > 0) raw = body;
+    }
+  } catch { /* fall through to the fallback below */ }
+
+  if (!raw) {
+    // pizzint.watch is down, erroring, or answering an empty data array
+    // (observed 2026-09-29) — try the free pentagonpizzaalert.com fallback
+    // before giving up.
+    return fetchPentagonPizzaAlert();
   }
 
   const locations = projectLocations(raw.data);

@@ -17,17 +17,31 @@ const validResponse = { success: true, data: [{
   percentage_of_usual: 150, data_freshness: 'fresh', recorded_at: '2026-09-25T11:39:00Z',
 }] };
 
+// Unmatched by design: pentagonpizzaalert.com fallback parsing must throw on
+// this, so tests that never configure `state.ppa` keep the pre-fallback
+// "preserving last good observation" behavior.
+const PPA_NO_MATCH_HTML = '<html><body>maintenance</body></html>';
+const PPA_FIXTURE_HTML = '<html><body>'
+  + '<h2 class="text-[200px]">ELEVATED</h2>'
+  + '<div class="eyebrow">Composite</div><div class="fig text-[216px]">63</div>'
+  + '<a aria-label="District Pizza Palace, 82 percent, VERY BUSY" href="/locations/district-pizza-palace">x</a>'
+  + '<a aria-label="Domino&#x27;s Pizza, 4 percent, QUIET" href="/locations/dominos-pizza">x</a>'
+  + '</body></html>';
+
 function harness() {
   const state = {
     source: validResponse, writes: [], warnings: [], cache: new Map(), now: 1_790_335_140_000, failPayload: false,
     urls: [], gdelt: { ok: true, status: 200, json: async () => ({}) },
+    ppa: { ok: true, status: 200, text: async () => PPA_NO_MATCH_HTML },
   };
   class Clock extends Date { static now() { return state.now; } }
   const context = vm.createContext({
     Date: Clock, AbortSignal, CHROME_UA: 'test', console: { log() {}, warn: (...args) => state.warnings.push(args) },
     fetch: async (url) => {
       state.urls.push(url);
-      return url.includes('dashboard-data') ? { ok: true, json: async () => state.source } : state.gdelt;
+      if (url.includes('dashboard-data')) return { ok: true, json: async () => state.source };
+      if (url.includes('pentagonpizzaalert.com')) return state.ppa;
+      return state.gdelt;
     },
     upstashSet: async (key, data, ttl) => {
       if (key === payloadKey && state.failPayload) return false;
@@ -145,4 +159,42 @@ test('reports a rejected GDELT request by status without logging its body', asyn
   await seed();
   assert.deepEqual(state.warnings, [['[PizzINT] GDELT tensions request rejected (HTTP 400)']]);
   assert.ok(state.writes.includes(payloadKey), 'a GDELT failure never blocks the PizzINT publication');
+});
+
+test('falls back to pentagonpizzaalert.com when pizzint.watch has no data, and publishes it', async () => {
+  const { state, seed } = harness();
+  state.source = emptyResponse;
+  state.ppa = { ok: true, status: 200, text: async () => PPA_FIXTURE_HTML };
+  await seed();
+  const pizzint = state.cache.get(payloadKey).data.data.pizzint;
+  assert.equal(pizzint.defconLevel, 3, 'ELEVATED maps to DEFCON 3');
+  assert.equal(pizzint.defconLabel, 'Elevated Activity');
+  assert.equal(pizzint.aggregateActivity, 63);
+  assert.equal(pizzint.locationsMonitored, 2);
+  assert.equal(pizzint.activeSpikes, 1, 'only the VERY BUSY venue counts as a spike');
+  assert.deepEqual(
+    pizzint.locations.map((l) => [l.name, l.currentPopularity, l.dataSource]),
+    [
+      ['District Pizza Palace', 82, 'pentagonpizzaalert.com'],
+      ["Domino's Pizza", 4, 'pentagonpizzaalert.com'],
+    ],
+    'entity-decoded name and static address/lat/lng carried through',
+  );
+  assert.equal(pizzint.locations[0].address, '2325 S Eads St, Arlington, VA');
+  assert.equal(pizzint.locations[0].lat, 38.8527414);
+  assert.ok(state.writes.includes(payloadKey), 'the fallback reading is actually published');
+});
+
+test('a pentagonpizzaalert.com fallback failure still preserves the last good observation', async () => {
+  const { state, seed } = harness();
+  await seed(); // seeds a valid pizzint.watch reading first
+  const previous = structuredClone(state.cache);
+  state.now += 600_000;
+  state.source = emptyResponse;
+  state.ppa = { ok: false, status: 503, text: async () => '' };
+  await seed();
+  assert.deepEqual(state.cache, previous);
+  assert.deepEqual(state.warnings, [[
+    '[PizzINT] No data in API response (empty_array); preserving last good observation',
+  ]]);
 });
