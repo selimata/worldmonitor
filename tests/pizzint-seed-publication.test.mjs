@@ -182,6 +182,12 @@ test('falls back to pentagonpizzaalert.com when pizzint.watch has no data, and p
   );
   assert.equal(pizzint.locations[0].address, '2325 S Eads St, Arlington, VA');
   assert.equal(pizzint.locations[0].lat, 38.8527414);
+  // Distinct, non-empty placeIds — the iOS client keys Identifiable/ForEach
+  // identity on placeId (PizzIntLocation.id); an empty string for every
+  // venue collapsed all rows into one SwiftUI identity (regression, 2026-09-29).
+  const placeIds = pizzint.locations.map((l) => l.placeId);
+  assert.ok(placeIds.every((id) => id.length > 0), 'every venue has a non-empty placeId');
+  assert.equal(new Set(placeIds).size, placeIds.length, 'placeIds are unique per venue');
   assert.ok(state.writes.includes(payloadKey), 'the fallback reading is actually published');
 });
 

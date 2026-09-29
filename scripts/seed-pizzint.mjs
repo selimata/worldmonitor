@@ -167,7 +167,12 @@ async function fetchPentagonPizzaAlert() {
     const meta = PENTAGON_PIZZA_ALERT_VENUES[slug] || {};
     const state = rawState.trim();
     return {
-      placeId: '',
+      // No Google Place ID from this source, but placeId is what the iOS
+      // client keys Identifiable/ForEach identity on (PizzIntLocation.id) —
+      // an empty string for every venue collapses all 11 rows into one
+      // SwiftUI identity and the list renders the same row repeatedly
+      // (observed 2026-09-29). The slug is stable and unique per venue.
+      placeId: `ppa:${slug}`,
       name: decodePpaEntities(rawName),
       address: meta.address || '',
       currentPopularity: Number(percentStr),
