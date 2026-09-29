@@ -165,7 +165,7 @@ describe('observeCriticalAlert — start', () => {
   it('skips an empty title and an alert published outside the start window', async () => {
     const { dispatcher, sender } = harness();
     assert.equal((await dispatcher.observeCriticalAlert({ title: '  ' })).action, 'skipped');
-    const stale = await dispatcher.observeCriticalAlert({ ...ALERT, publishedAt: T0 - 2 * HOUR });
+    const stale = await dispatcher.observeCriticalAlert({ ...ALERT, publishedAt: T0 - 4 * HOUR });
     assert.equal(stale.action, 'noop');
     assert.equal(stale.reason, 'outside-start-window');
     assert.equal(sender.sent.length, 0);

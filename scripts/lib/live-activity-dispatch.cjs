@@ -45,7 +45,12 @@ const TRANSLATED_TITLE_MAX_CHARS = 200;
 
 const LIVE_ACTIVITY_MAX_ACTIVE_MS = 4 * 60 * 60 * 1000;
 const LIVE_ACTIVITY_STALE_MS = 60 * 60 * 1000;
-const LIVE_ACTIVITY_START_WINDOW_MS = 60 * 60 * 1000;
+// Measured from the article's publishedAt, not from when the relay first sees
+// it. Was 60 min, but a story reaches the relay ~55-70 min after publication
+// (1h per-feed RSS cache + 15 min digest cache + 15 min classify loop), so
+// nearly every critical landed as `outside-start-window` and fell back to a
+// banner (2026-09-27..29: 13 starts, 24 criticals declined as outside-start-window).
+const LIVE_ACTIVITY_START_WINDOW_MS = 3 * 60 * 60 * 1000;
 // Minimum spacing between two STARTS. Nothing else in this file limits how
 // often a new activity may be raised, and the identity is the headline hash —
 // so one story carried by four outlets under four wordings is four alerts, and
