@@ -4330,6 +4330,63 @@ async function startClassifySeedLoop() {
 }
 
 // ─────────────────────────────────────────────────────────────
+// News feed warming — keeps the digest's per-feed parse cache minutes old.
+// A digest build only re-fetches feeds whose 1h cache row expired, so a story
+// could wait up to an hour in its feed before the digest (and the classify
+// loop above, and every push after it) saw it. The build cannot fetch every
+// feed itself: its fetch deadline covers about a quarter of them. So the relay
+// asks the deployment to re-fetch the stale ones in the background, every
+// couple of minutes (api/news-feed-warm.ts → warmFeedCache).
+// ─────────────────────────────────────────────────────────────
+const FEED_WARM_INTERVAL_MS = Math.max(60_000, Number(process.env.FEED_WARM_INTERVAL_MS) || 2 * 60 * 1000);
+const FEED_WARM_TARGETS = (process.env.FEED_WARM_TARGETS || 'full:en').split(',').map((t) => t.trim()).filter(Boolean);
+let feedWarmInFlight = false;
+
+async function warmNewsFeeds() {
+  if (feedWarmInFlight) return;
+  feedWarmInFlight = true;
+  try {
+    for (const target of FEED_WARM_TARGETS) {
+      const [variant, lang = 'en'] = target.split(':');
+      try {
+        const resp = await fetch(`${WM_API_BASE_URL}/api/news-feed-warm?variant=${encodeURIComponent(variant)}&lang=${encodeURIComponent(lang)}`, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${RELAY_SHARED_SECRET}`, 'User-Agent': CHROME_UA },
+          signal: AbortSignal.timeout(40_000),
+        });
+        const body = await resp.json().catch(() => null);
+        if (!resp.ok || !body) {
+          console.warn(`[FeedWarm] ${target}: HTTP ${resp.status}`);
+          continue;
+        }
+        console.log(
+          `[FeedWarm] ${target}: ${body.refreshed} refreshed, ${body.failed} failed, ${body.notStarted} deferred ` +
+          `of ${body.stale} stale / ${body.feeds} feeds in ${body.elapsedMs}ms`,
+        );
+      } catch (e) {
+        console.warn(`[FeedWarm] ${target}: ${e?.message || e}`);
+      }
+    }
+  } finally {
+    feedWarmInFlight = false;
+  }
+}
+
+function startFeedWarmLoop() {
+  if (process.env.FEED_WARM_ENABLED === '0') {
+    console.log('[FeedWarm] Disabled (FEED_WARM_ENABLED=0)');
+    return;
+  }
+  if (!RELAY_SHARED_SECRET) {
+    console.log('[FeedWarm] Disabled (no RELAY_SHARED_SECRET)');
+    return;
+  }
+  console.log(`[FeedWarm] Loop starting (every ${FEED_WARM_INTERVAL_MS / 1000}s → ${WM_API_BASE_URL}, targets ${FEED_WARM_TARGETS.join(',')})`);
+  warmNewsFeeds();
+  setInterval(warmNewsFeeds, FEED_WARM_INTERVAL_MS).unref?.();
+}
+
+// ─────────────────────────────────────────────────────────────
 // Live Activity (APNs) hook — CRITICAL news alerts become iOS Live Activities.
 // Detection stays inside seedClassifyForVariant (the LLM critical branch plus
 // cached critical hits); the start/update/end decision and the Redis-backed
@@ -13696,6 +13753,7 @@ server.listen(PORT, () => {
   startChokepointWarmPingLoop();
   startCableHealthWarmPingLoop();
   startClassifySeedLoop();
+  startFeedWarmLoop();
   startLiveActivitySweeper();
   // Not a loop — the broadcast hook is driven by the classify pass. This only
   // prints the arming state so a boot log answers "why did nothing push?".

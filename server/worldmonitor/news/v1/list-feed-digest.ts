@@ -8,7 +8,7 @@ import type {
   StoryMeta as ProtoStoryMeta,
   StoryPhase as ProtoStoryPhase,
 } from '../../../../src/generated/server/worldmonitor/news/v1/service_server';
-import { cachedFetchJson, cachedFetchJsonWithMeta, getCachedJson, setCachedJson, getCachedJsonBatch, runRedisPipeline } from '../../../_shared/redis';
+import { cachedFetchJson, cachedFetchJsonWithMeta, getCachedJson, setCachedJson, getCachedJsonBatch, runRedisPipeline, type RedisCommandResult, type RedisPipelineCommand } from '../../../_shared/redis';
 import { markNoCacheResponse } from '../../../_shared/response-headers';
 import { sha256Hex } from '../../../_shared/hash';
 import { CHROME_UA } from '../../../_shared/constants';
@@ -491,10 +491,24 @@ interface ParseResult {
 const CACHE_TTL_HEALTHY_S = 3600;
 const CACHE_TTL_EMPTY_S = 300;
 
+/** The per-feed parse cache key; the version history is at its use in fetchAndParseRss. */
+function feedCacheKey(variant: string, feed: Pick<ServerFeed, 'url'>): string {
+  return `rss:feed:v9:${variant}:${feed.url}`;
+}
+
+/**
+ * How a caller wants the per-feed cache treated. The digest build reads it
+ * (default); the background warmer (warmFeedCache) re-fetches regardless and
+ * must never replace a good cached parse with a failed one — a throttled
+ * upstream would otherwise empty a feed that was fine a minute ago.
+ */
+type FeedFetchMode = { bypassCache?: boolean; keepOnFailure?: boolean };
+
 async function fetchAndParseRss(
   feed: ServerFeed,
   variant: string,
   signal: AbortSignal,
+  { bypassCache = false, keepOnFailure = false }: FeedFetchMode = {},
 ): Promise<ParseResult> {
   // v5 cache shape: identical struct to v4 but a new prefix invalidates
   // every pre-fix entry on deploy. v4 entries cached pre-PR contain
@@ -522,7 +536,7 @@ async function fetchAndParseRss(
   // v8→v9 (#7083): ParseResult gained the `attempt` field. Warm v8 rows
   // lack it, so zero-item entries could not be classified between
   // negative-cache and fresh-failure; force a cold parse on rollout.
-  const cacheKey = `rss:feed:v9:${variant}:${feed.url}`;
+  const cacheKey = feedCacheKey(variant, feed);
 
   try {
     // Read cache unconditionally — the v5 prefix guarantees pre-fix
@@ -532,7 +546,7 @@ async function fetchAndParseRss(
     // request within 5 minutes hits cache instead of upstream. This is
     // what the PR description claimed and what review P1 flagged was
     // missing.
-    const cached = (await getCachedJson(cacheKey)) as ParseResult | null;
+    const cached = bypassCache ? null : (await getCachedJson(cacheKey)) as ParseResult | null;
     if (cached) {
       if (cached.parsedTotal === 0 && cached.items.length === 0) {
         // Only a cached prior fetch failure is negative. A valid RSS body
@@ -615,7 +629,7 @@ async function fetchAndParseRss(
         negativeCache: false,
       };
       const empty: ParseResult = { items: [], parsedTotal: 0, droppedUndated: 0, attempt };
-      await setCachedJson(cacheKey, empty, CACHE_TTL_EMPTY_S);
+      if (!keepOnFailure) await setCachedJson(cacheKey, empty, CACHE_TTL_EMPTY_S);
       return empty;
     }
 
@@ -635,7 +649,7 @@ async function fetchAndParseRss(
     // Long cache only for healthy parses; short cache for zero-from-zero so
     // transient upstream issues don't sticky-fail for an hour.
     const ttl = result.parsedTotal > 0 ? CACHE_TTL_HEALTHY_S : CACHE_TTL_EMPTY_S;
-    await setCachedJson(cacheKey, result, ttl);
+    if (result.parsedTotal > 0 || !keepOnFailure) await setCachedJson(cacheKey, result, ttl);
     return result;
   } catch {
     return {
@@ -1882,6 +1896,117 @@ async function buildDigest(variant: string, lang: string): Promise<ListFeedDiges
 }
 
 /** Internal exports for unit tests only — do not import in production code. */
+// ── Background feed warming ─────────────────────────────────────────────
+// A digest build fetches only the feeds whose parse cache expired, and a
+// healthy parse lives CACHE_TTL_HEALTHY_S (1h). So a story could sit up to an
+// hour in a feed before the digest saw it: on 2026-09-30 the Dubai-Tel Aviv
+// hijack alert reached the app ~1h after publication. The TTL cannot simply
+// drop: a build has OVERALL_DEADLINE_MS to fetch, which covers roughly a
+// quarter of the feeds, and the rest would time out of every build.
+//
+// Instead the relay calls warmFeedCache every couple of minutes (via
+// api/news-feed-warm.ts). Each call re-fetches the feeds whose parse is older
+// than FEED_WARM_MAX_AGE_S, stalest first, for as long as its own budget
+// allows, and rewrites the same cache rows the build reads. The build then
+// finds almost every feed warm and fresh. A failed re-fetch leaves the good
+// row in place (keepOnFailure): the build's own path still handles expiry.
+
+export const FEED_WARM_MAX_AGE_S = 600;
+/** No new fetch starts after this; one in flight still has FEED_TIMEOUT_MS. Fits the 25s Edge ceiling. */
+export const FEED_WARM_START_BUDGET_MS = 12_000;
+
+export interface FeedWarmResult {
+  variant: string;
+  lang: string;
+  feeds: number;
+  stale: number;
+  refreshed: number;
+  failed: number;
+  notStarted: number;
+  redis: boolean;
+  elapsedMs: number;
+}
+
+/**
+ * The feeds whose cached parse is older than maxAgeS, stalest first. A row
+ * holds its write TTL minus its age, so a healthy row younger than maxAgeS
+ * still has more than CACHE_TTL_HEALTHY_S - maxAgeS left. Missing rows (-2),
+ * short-lived failure rows and unreadable TTLs all count as stale.
+ */
+export function selectStaleFeeds(
+  feeds: ServerFeed[],
+  ttls: RedisCommandResult[],
+  maxAgeS: number,
+): ServerFeed[] {
+  const freshAbove = CACHE_TTL_HEALTHY_S - maxAgeS;
+  return feeds
+    .map((feed, i) => {
+      const ttl = Number(ttls[i]?.result);
+      return { feed, ttl: Number.isFinite(ttl) ? ttl : -2 };
+    })
+    .filter(({ ttl }) => ttl !== -1 && ttl < freshAbove)
+    .sort((a, b) => a.ttl - b.ttl)
+    .map(({ feed }) => feed);
+}
+
+export async function warmFeedCache(
+  variant = 'full',
+  lang = 'en',
+  {
+    maxAgeS = FEED_WARM_MAX_AGE_S,
+    startBudgetMs = FEED_WARM_START_BUDGET_MS,
+    pipeline = runRedisPipeline,
+    refresh = (feed: ServerFeed, signal: AbortSignal) =>
+      fetchAndParseRss(feed, variant, signal, { bypassCache: true, keepOnFailure: true }),
+    now = Date.now,
+  }: {
+    maxAgeS?: number;
+    startBudgetMs?: number;
+    pipeline?: (commands: RedisPipelineCommand[]) => Promise<RedisCommandResult[]>;
+    refresh?: (feed: ServerFeed, signal: AbortSignal) => Promise<ParseResult>;
+    now?: () => number;
+  } = {},
+): Promise<FeedWarmResult> {
+  const start = now();
+  const byUrl = new Map<string, ServerFeed>();
+  for (const { feed } of buildDigestFeedBatches(variant, lang).allEntries) byUrl.set(feed.url, feed);
+  const feeds = [...byUrl.values()];
+  const base = { variant, lang, feeds: feeds.length, stale: 0, refreshed: 0, failed: 0, notStarted: 0 };
+
+  // No TTLs means no Redis: warming would write nowhere the build can read.
+  const ttls = await pipeline(feeds.map((feed) => ['TTL', feedCacheKey(variant, feed)]));
+  if (ttls.length !== feeds.length) return { ...base, redis: false, elapsedMs: now() - start };
+
+  const stale = selectStaleFeeds(feeds, ttls, maxAgeS);
+  const controller = new AbortController();
+  const hardStop = setTimeout(() => controller.abort(), startBudgetMs + FEED_TIMEOUT_MS + 1_000);
+  let next = 0;
+  let refreshed = 0;
+  let failed = 0;
+  const worker = async () => {
+    while (next < stale.length && now() - start < startBudgetMs && !controller.signal.aborted) {
+      const feed = stale[next++]!;
+      const result = await refresh(feed, controller.signal);
+      if (result.parsedTotal > 0) refreshed++;
+      else failed++;
+    }
+  };
+  try {
+    await Promise.all(Array.from({ length: Math.min(BATCH_CONCURRENCY, stale.length) }, worker));
+  } finally {
+    clearTimeout(hardStop);
+  }
+  return {
+    ...base,
+    stale: stale.length,
+    refreshed,
+    failed,
+    notStarted: stale.length - next,
+    redis: true,
+    elapsedMs: now() - start,
+  };
+}
+
 export const __testing__ = {
   buildDigestFeedBatches,
   parseRssXml,

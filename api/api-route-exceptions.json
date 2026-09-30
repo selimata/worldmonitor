@@ -587,6 +587,13 @@
       "removal_issue": null
     },
     {
+      "path": "api/news-feed-warm.ts",
+      "category": "ops-admin",
+      "reason": "Relay-driven cache warmer for the news digest: re-fetches stale RSS feeds into the per-feed parse cache (rss:feed:v9:*) so list-feed-digest builds from minutes-old feeds instead of hour-old ones. Bearer RELAY_SHARED_SECRET, called only by scripts/ais-relay.cjs; operator plumbing with no product response shape.",
+      "owner": "@selimata",
+      "removal_issue": null
+    },
+    {
       "path": "api/seed-contract-probe.ts",
       "category": "ops-admin",
       "reason": "Cron probe that verifies seed contract shapes against upstreams. Operator telemetry.",
