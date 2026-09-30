@@ -327,6 +327,7 @@ const HOST_ORIGINS = Object.freeze({
   'ourworldindata.org': 'GB',
   'owid-public.owid.io': 'GB',
   'patents.google.com': 'US',
+  'pentagonpizzaalert.com': 'US',
   'phys.org': 'GB',
   'pitchbook.com': 'US',
   'polymarket.com': 'US',
