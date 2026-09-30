@@ -62,6 +62,8 @@ COPY scripts/lib/live-activity-dispatch.cjs ./scripts/lib/live-activity-dispatch
 # missing COPY is a boot crash loop, not a disabled feature.
 COPY scripts/lib/broadcast-push.cjs ./scripts/lib/broadcast-push.cjs
 COPY scripts/lib/brief-push.cjs ./scripts/lib/brief-push.cjs
+# Headline pool for the daily Discover brief (scripts/lib/brief-pool.cjs).
+COPY scripts/lib/brief-pool.cjs ./scripts/lib/brief-pool.cjs
 COPY scripts/shared/country-name-to-iso2.cjs ./scripts/shared/country-name-to-iso2.cjs
 # country-names.json backs the full name→ISO2 map (#5359 uniform country
 # scoping); required by country-name-to-iso2.cjs at startup.

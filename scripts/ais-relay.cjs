@@ -41,6 +41,7 @@ const { createLiveActivityDispatcher, createUpstashCommandClient } = require('./
 const { createBroadcastPushDispatcher, LEVEL_RANK: BROADCAST_LEVEL_RANK } = require('./lib/broadcast-push.cjs');
 // AI World Brief slot push — docs/broadcast-push.md.
 const { createBriefPushNotifier } = require('./lib/brief-push.cjs');
+const { buildBriefPoolCommands } = require('./lib/brief-pool.cjs');
 const {
   YahooQuoteSummaryClient,
   buildSectorSeedMeta,
@@ -429,6 +430,28 @@ function upstashMGet(keys) {
     req.on('error', () => resolve(keys.map(() => null)));
     req.on('timeout', () => { req.destroy(); resolve(keys.map(() => null)); });
     req.end(body);
+  });
+}
+
+/** Runs commands in one /pipeline call; resolves false on any transport or HTTP failure. */
+function upstashPipeline(commands) {
+  return new Promise((resolve) => {
+    if (!UPSTASH_ENABLED || commands.length === 0) return resolve(false);
+    const url = new URL('/pipeline', UPSTASH_REDIS_REST_URL);
+    const req = UPSTASH_HTTP_MODULE.request(url, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${UPSTASH_REDIS_REST_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+      timeout: 10000,
+    }, (resp) => {
+      resp.resume();
+      resolve(resp.statusCode >= 200 && resp.statusCode < 300);
+    });
+    req.on('error', () => resolve(false));
+    req.on('timeout', () => { req.destroy(); resolve(false); });
+    req.end(JSON.stringify(commands));
   });
 }
 
@@ -4095,6 +4118,15 @@ async function seedClassifyForVariant(variant, seenTitles) {
     digest = JSON.parse(body);
   } catch {
     return { total: 0, classified: 0, skipped: 0 };
+  }
+
+  // The daily Discover brief needs every headline of its 12-hour window, and
+  // the digest keeps only 20 per category (lib/brief-pool.cjs).
+  if (variant === 'full') {
+    const poolCommands = buildBriefPoolCommands(digest);
+    if (poolCommands.length && !(await upstashPipeline(poolCommands))) {
+      console.warn('[BriefPool] write failed');
+    }
   }
 
   // Map of title → item metadata; recency gate: skip articles older than 6h

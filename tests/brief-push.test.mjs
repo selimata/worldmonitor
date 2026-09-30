@@ -83,6 +83,8 @@ const BASE_ENV = {
   BRIEF_PUSH_DRY_RUN: '0',
   PUSH_ADMIN_SECRET: 'test-secret',
   BRIEF_PUSH_BASE_URL: 'https://example.test',
+  // The Discover route check is its own suite below; here every tap is the AI brief.
+  BRIEF_PUSH_DISCOVER_SLUG: '',
 };
 
 // 2026-09-01T07:00Z — Europe/Istanbul (UTC+3) is at local 10:00.
@@ -457,5 +459,56 @@ describe('live activity variant scoping', () => {
   it('threads the variant through both critical call sites', () => {
     assert.match(relaySrc2, /observeCriticalSurfaces\(titleArr\[i\], allTitles\.get\(titleArr\[i\]\), level, variant\);/);
     assert.match(relaySrc2, /observeCriticalSurfaces\(chunk\[idx\], meta, level, variant\);/);
+  });
+});
+
+// ── Discover daily brief route ────────────────────────────────────────────────
+
+describe('tap route', () => {
+  // GETs answer the article check; POSTs are sends.
+  function routedFetch(article) {
+    const sends = [];
+    const gets = [];
+    const fn = async (url, init) => {
+      if (init?.method === 'POST') {
+        sends.push(JSON.parse(init.body));
+        return { status: 200, json: async () => ({ matched: 1, sent: 1, nextCursor: null }) };
+      }
+      gets.push(url);
+      if (article instanceof Error) throw article;
+      if (!article) return { status: 404, json: async () => ({}) };
+      return { status: 200, json: async () => article };
+    };
+    fn.sends = sends;
+    fn.gets = gets;
+    return fn;
+  }
+  const withDiscover = { BRIEF_PUSH_DISCOVER_SLUG: 'daily-brief' };
+
+  it('opens the Discover brief when it was updated recently', async () => {
+    const fetchImpl = routedFetch({ updatedAt: '2026-09-01T04:10:00Z' });
+    const { notifier } = make(withDiscover, { fetchImpl });
+    await notifier.notifyPublished();
+    assert.equal(fetchImpl.gets[0], 'https://example.test/api/discover/articles/daily-brief.json?lang=en');
+    assert.deepEqual(fetchImpl.sends[0].route, { type: 'discover', path: '/article/daily-brief' });
+  });
+
+  it('falls back to the AI brief when the article is stale, missing or unreachable', async () => {
+    for (const article of [{ updatedAt: '2026-08-31T12:00:00Z' }, null, { title: 'no date' }, new Error('timeout')]) {
+      const fetchImpl = routedFetch(article);
+      const { notifier } = make(withDiscover, { fetchImpl });
+      await notifier.notifyPublished();
+      assert.deepEqual(fetchImpl.sends[0].route, { type: 'brief' });
+    }
+  });
+
+  it('defaults to the daily-brief slug and skips the check when disabled', async () => {
+    const fetchImpl = routedFetch({ updatedAt: '2026-09-01T06:00:00Z' });
+    const { notifier } = make({ BRIEF_PUSH_DISCOVER_SLUG: undefined }, { fetchImpl });
+    assert.equal(notifier.config.discoverSlug, 'daily-brief');
+    const off = routedFetch({ updatedAt: '2026-09-01T06:00:00Z' });
+    await make({}, { fetchImpl: off }).notifier.notifyPublished();
+    assert.equal(off.gets.length, 0);
+    assert.deepEqual(off.sends[0].route, { type: 'brief' });
   });
 });

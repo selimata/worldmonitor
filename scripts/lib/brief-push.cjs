@@ -56,6 +56,10 @@
  *   BRIEF_PUSH_COHORTS    comma list, default "low"
  *   BRIEF_PUSH_PAGE_SIZE  devices per request, default 5000
  *   BRIEF_PUSH_MAX_PAGES  runaway guard, default 20
+ *   BRIEF_PUSH_DISCOVER_SLUG  Discover article the tap opens, default "daily-brief";
+ *                         "" keeps every tap on the in-app AI brief
+ *   BRIEF_PUSH_DISCOVER_MAX_AGE_H  older than this, the tap falls back to the
+ *                         AI brief, default 14
  *   APNS_ENVIRONMENT      "sandbox" routes to the APNs sandbox
  *
  * Resolves, never rejects: a push failure must not fail the seed run that
@@ -71,6 +75,9 @@ const DEFAULT_MORNING_HOUR = 10;
 const DEFAULT_EVENING_HOUR = 19;
 const DEFAULT_PAGE_SIZE = 5_000;
 const DEFAULT_MAX_PAGES = 20;
+const DEFAULT_DISCOVER_SLUG = 'daily-brief';
+const DEFAULT_DISCOVER_MAX_AGE_H = 14;
+const DISCOVER_CHECK_TIMEOUT_MS = 10_000;
 /**
  * A slot fires once per zone per day, so the dedup key only has to survive one
  * hourly tick. 6h gives a stalled or retried cron plenty of room without ever
@@ -298,11 +305,43 @@ function createBriefPushNotifier({ env, redis, fetchImpl, log = console, now = (
     evening: envInt(env, SLOTS.evening.envKey, SLOTS.evening.defaultHour, 0, 23),
   });
 
+  const discoverSlug = /^[a-z0-9-]{1,120}$/.test(env.BRIEF_PUSH_DISCOVER_SLUG ?? DEFAULT_DISCOVER_SLUG)
+    ? (env.BRIEF_PUSH_DISCOVER_SLUG ?? DEFAULT_DISCOVER_SLUG)
+    : '';
+  const discoverMaxAgeMs = envInt(env, 'BRIEF_PUSH_DISCOVER_MAX_AGE_H', DEFAULT_DISCOVER_MAX_AGE_H, 1, 72) * 3600_000;
+
   const enabled = armed && !!secret && typeof doFetch === 'function';
   const config = Object.freeze({
     enabled, armed, dryRun, sandbox, baseUrl, pageSize, maxPages, slotHours,
-    cohorts: audienceCohorts, hasSecret: !!secret,
+    cohorts: audienceCohorts, hasSecret: !!secret, discoverSlug,
   });
+
+  /**
+   * Where the tap lands. The daily brief is a Discover article written twice a
+   * day in a Claude Code session (monitor-landing-web, skill `daily-brief`), so
+   * it can be late or missing; then the tap opens the hourly in-app AI brief,
+   * which is always there. Any doubt (timeout, 404, no date) is a fallback.
+   */
+  async function resolveRoute(at) {
+    const fallback = { type: 'brief' };
+    if (!discoverSlug) return fallback;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), DISCOVER_CHECK_TIMEOUT_MS);
+    try {
+      const res = await doFetch(`${baseUrl}/api/discover/articles/${discoverSlug}.json?lang=en`, {
+        headers: { Accept: 'application/json', 'User-Agent': 'worldmonitor-brief-push/1.0' },
+        signal: controller.signal,
+      });
+      if (res.status !== 200) return fallback;
+      const updatedAt = Date.parse((await res.json())?.updatedAt ?? '');
+      if (!Number.isFinite(updatedAt) || at.getTime() - updatedAt > discoverMaxAgeMs) return fallback;
+      return { type: 'discover', path: `/article/${discoverSlug}` };
+    } catch {
+      return fallback;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
 
   async function post(payload) {
     const controller = new AbortController();
@@ -364,7 +403,7 @@ function createBriefPushNotifier({ env, redis, fetchImpl, log = console, now = (
     }
   }
 
-  function buildPayload(slot, zones) {
+  function buildPayload(slot, zones, route = { type: 'brief' }) {
     return {
       audience: {
         priority: [...audienceCohorts],
@@ -375,9 +414,9 @@ function createBriefPushNotifier({ env, redis, fetchImpl, log = console, now = (
         limit: pageSize,
       },
       alert: { title: localizedTitle(slot), body: localizedBody(slot) },
-      // PushRoute.brief -> World Report with the AI brief opened, so the tap
-      // lands on the thing the banner is talking about.
-      route: { type: 'brief' },
+      // The Discover daily brief when it is current, else PushRoute.brief (the
+      // in-app AI brief); see resolveRoute.
+      route,
       // Per slot, so the evening banner replaces an unread morning one rather
       // than stacking two digests on the lock screen.
       collapseId: `brief-${slot}`,
@@ -412,7 +451,8 @@ function createBriefPushNotifier({ env, redis, fetchImpl, log = console, now = (
       };
     }
 
-    const result = await pageThrough(buildPayload(slot, zones));
+    const route = await resolveRoute(at);
+    const result = await pageThrough(buildPayload(slot, zones, route));
 
     if (!result.ok) {
       const nothingSent = result.pages === 0;
@@ -428,7 +468,7 @@ function createBriefPushNotifier({ env, redis, fetchImpl, log = console, now = (
 
     log.log?.(
       `[BriefPush] ${dryRun ? 'DRY-RUN' : 'SENT'} ${slot} (local ${hour}:00, ${zones.length} zones) ` +
-      `-> priority[${audienceCohorts.join(',')}] matched=${result.matched}` +
+      `-> priority[${audienceCohorts.join(',')}] route=${route.path ?? route.type} matched=${result.matched}` +
       `${dryRun ? '' : ` sent=${result.sent}`}${result.complete ? '' : ' (TRUNCATED)'}`,
     );
     return {
