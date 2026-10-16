@@ -166,6 +166,10 @@ function createLiveActivityDispatcher({
   // tests, a relay with no LLM provider) means everyone keeps the English
   // headline, which is exactly what shipped before.
   translate = null,
+  // () => Promise<Set<revenueCatId> | null> — readers whose Push Alerts are
+  // off (see createOptedOutReader). Absent or null means no filter, which is
+  // what shipped before.
+  optedOut = null,
   log = console,
   now = Date.now,
   maxActiveMs = LIVE_ACTIVITY_MAX_ACTIVE_MS,
@@ -223,6 +227,42 @@ function createLiveActivityDispatcher({
   async function hasUpdateTokens(alertId) {
     const count = await redis.command(['HLEN', updateTokensKey(alertId)]);
     return Number(count) > 0;
+  }
+
+  /**
+   * Drops the push-to-start tokens of readers who switched Push Alerts off.
+   *
+   * The app is supposed to deregister the token itself when the switch goes
+   * off, but it can only drop a token it holds, and when it holds none the
+   * token stays here and every critical story raises a card on that phone —
+   * under iOS's separate Live Activities switch, so turning notifications off
+   * in iOS does not stop it either (2026-10-16: 20-30 a day for one reader).
+   * The device row in Mongo is the source of truth, so ask it here.
+   *
+   * Skipped, not removed: a reader who switches back on gets cards again with
+   * no re-registration. Fails open, as before this filter existed.
+   */
+  async function withoutOptedOut(tokens) {
+    if (tokens.length === 0 || typeof optedOut !== 'function') return tokens;
+    let ids = null;
+    try {
+      ids = await optedOut();
+    } catch (e) {
+      log.warn(`[LiveActivity] opted-out lookup failed: ${e?.message || e}`);
+    }
+    if (!ids || ids.size === 0) return tokens;
+    let rcs = [];
+    try {
+      rcs = await redis.command(['HMGET', KEY_RC, ...tokens]);
+    } catch (e) {
+      log.warn(`[LiveActivity] rc lookup failed: ${e?.message || e}`);
+      return tokens;
+    }
+    const kept = tokens.filter((_, i) => !(Array.isArray(rcs) && typeof rcs[i] === 'string' && ids.has(rcs[i])));
+    if (kept.length !== tokens.length) {
+      log.log(`[LiveActivity] skipped ${tokens.length - kept.length} push-to-start token(s) of readers with Push Alerts off`);
+    }
+    return kept;
   }
 
   function contentStateFor(record) {
@@ -354,7 +394,7 @@ function createLiveActivityDispatcher({
     await redis.command([
       'SET', KEY_LAST_START, String(now()), 'PX', String(Math.max(1, startCooldownMs)),
     ]);
-    const tokens = await listPushToStartTokens();
+    const tokens = await withoutOptedOut(await listPushToStartTokens());
     const { base, out: stateByToken } = await statesByToken(record, tokens);
     const stats = await fanOut(
       tokens,
@@ -501,6 +541,36 @@ function createLiveActivityDispatcher({
   return { observeCriticalAlert, sweep, endActive, readActive };
 }
 
+/**
+ * Reads /api/push/opted-out on the landing backend (the RevenueCat ids whose
+ * Push Alerts are off), cached for `ttlMs`. Same base URL and bearer as the
+ * broadcast push. A failed read keeps serving the last good list; with none,
+ * it resolves null and the dispatcher sends to everyone, as before.
+ */
+function createOptedOutReader({ baseUrl, secret, fetchImpl = globalThis.fetch, now = Date.now, ttlMs = 5 * 60 * 1000, timeoutMs = 5000, log = console } = {}) {
+  if (!baseUrl || !secret) return null;
+  const url = `${String(baseUrl).replace(/\/+$/, '')}/api/push/opted-out`;
+  let cached = null;
+  let fetchedAt = -Infinity;
+  return async function optedOut() {
+    if (cached && now() - fetchedAt < ttlMs) return cached;
+    try {
+      const res = await fetchImpl(url, {
+        headers: { Authorization: `Bearer ${secret}` },
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const body = await res.json();
+      if (!Array.isArray(body?.revenueCatIds)) throw new Error('malformed body');
+      cached = new Set(body.revenueCatIds.filter((id) => typeof id === 'string' && id));
+      fetchedAt = now();
+    } catch (e) {
+      log.warn(`[LiveActivity] opted-out fetch failed${cached ? ' — using last list' : ''}: ${e?.message || e}`);
+    }
+    return cached;
+  };
+}
+
 module.exports = {
   KEY_ACTIVE,
   KEY_LANG,
@@ -516,6 +586,7 @@ module.exports = {
   LIVE_ACTIVITY_STARTED_TTL_S,
   PUSH_TO_START_TOKEN_TTL_MS,
   createLiveActivityDispatcher,
+  createOptedOutReader,
   createUpstashCommandClient,
   startedKey,
   updateTokensKey,

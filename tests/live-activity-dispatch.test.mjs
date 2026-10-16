@@ -41,6 +41,7 @@ function fakeRedis() {
       case 'EXPIRE': return store.has(key) ? 1 : 0;
       case 'HSET': { const h = store.get(key) instanceof Map ? store.get(key) : new Map(); h.set(rest[0], rest[1]); store.set(key, h); return 1; }
       case 'HDEL': { const h = store.get(key); return h instanceof Map && h.delete(rest[0]) ? 1 : 0; }
+      case 'HMGET': { const h = store.get(key); return rest.map((f) => (h instanceof Map && h.has(f) ? h.get(f) : null)); }
       case 'HKEYS': { const h = store.get(key); return h instanceof Map ? [...h.keys()] : []; }
       case 'HLEN': { const h = store.get(key); return h instanceof Map ? h.size : 0; }
       case 'ZADD': { const z = store.get(key) instanceof Map ? store.get(key) : new Map(); z.set(rest[1], Number(rest[0])); store.set(key, z); return 1; }
@@ -103,11 +104,12 @@ function quietLog() {
   return { lines, log: (m) => lines.push(['log', String(m)]), warn: (m) => lines.push(['warn', String(m)]) };
 }
 
-function harness({ redis = fakeRedis(), sender = fakeSender(), now } = {}) {
+function harness({ redis = fakeRedis(), sender = fakeSender(), now, optedOut } = {}) {
   const clock = { now: T0 };
   const dispatcher = dispatch.createLiveActivityDispatcher({
     redis,
     sender,
+    optedOut,
     log: quietLog(),
     now: now || (() => clock.now),
   });
@@ -179,6 +181,71 @@ describe('observeCriticalAlert — start', () => {
     assert.equal(result.action, 'noop');
     assert.equal(result.reason, 'activity-already-running');
     assert.equal(sender.sent.length, 0);
+  });
+});
+
+describe('observeCriticalAlert — readers with Push Alerts off', () => {
+  it('skips the push-to-start tokens of opted-out RevenueCat ids, without removing them', async () => {
+    const { redis, sender, dispatcher } = harness({ optedOut: async () => new Set(['rc-off']) });
+    redis.seedPushToStart(PTS);
+    await redis.command(['HSET', dispatch.KEY_RC, PTS[0], 'rc-off']);
+    await redis.command(['HSET', dispatch.KEY_RC, PTS[1], 'rc-on']);
+
+    const result = await dispatcher.observeCriticalAlert(ALERT);
+    assert.equal(result.action, 'started');
+    assert.deepEqual(new Set(sender.sent.map((s) => s.token)), new Set([PTS[1], PTS[2]]));
+    // Still registered: switching back on brings cards back with no re-register.
+    assert.deepEqual(new Set(redis.zset(dispatch.KEY_PUSH_TO_START)), new Set(PTS));
+  });
+
+  it('fails open when the opted-out list cannot be read', async () => {
+    const { redis, sender, dispatcher } = harness({ optedOut: async () => { throw new Error('down'); } });
+    redis.seedPushToStart(PTS);
+    await redis.command(['HSET', dispatch.KEY_RC, PTS[0], 'rc-off']);
+    await dispatcher.observeCriticalAlert(ALERT);
+    assert.equal(sender.sent.length, 3);
+  });
+});
+
+describe('createOptedOutReader', () => {
+  function reply(body, ok = true, status = 200) {
+    return { ok, status, json: async () => body };
+  }
+
+  it('is inert without a base URL or secret', () => {
+    assert.equal(dispatch.createOptedOutReader({ baseUrl: 'https://x', secret: '' }), null);
+    assert.equal(dispatch.createOptedOutReader({ baseUrl: '', secret: 's' }), null);
+  });
+
+  it('GETs /api/push/opted-out with the bearer, caches, and keeps the last list on failure', async () => {
+    const clock = { now: T0 };
+    const calls = [];
+    let next = reply({ revenueCatIds: ['rc-off', '', 7] });
+    const read = dispatch.createOptedOutReader({
+      baseUrl: 'https://landing.example/',
+      secret: 's3cret',
+      now: () => clock.now,
+      ttlMs: 1000,
+      log: quietLog(),
+      fetchImpl: async (url, init) => { calls.push({ url, auth: init.headers.Authorization }); return next; },
+    });
+    assert.deepEqual([...await read()], ['rc-off']);
+    assert.deepEqual(calls[0], { url: 'https://landing.example/api/push/opted-out', auth: 'Bearer s3cret' });
+    await read();
+    assert.equal(calls.length, 1);
+
+    clock.now += 1001;
+    next = reply({}, false, 500);
+    assert.deepEqual([...await read()], ['rc-off']);
+    assert.equal(calls.length, 2);
+  });
+
+  it('resolves null when the first read fails', async () => {
+    const read = dispatch.createOptedOutReader({
+      baseUrl: 'https://landing.example', secret: 's', log: quietLog(),
+      fetchImpl: async () => { throw new Error('offline'); },
+    });
+    assert.equal(await read(), null);
   });
 });
 
@@ -451,6 +518,10 @@ describe('createUpstashCommandClient', () => {
 describe('ais-relay wiring (source assertions)', () => {
   const relaySrc = readFileSync(resolve(__dirname, '..', 'scripts', 'ais-relay.cjs'), 'utf-8');
   const dockerfile = readFileSync(resolve(__dirname, '..', 'Dockerfile.relay'), 'utf-8');
+
+  it('hands the dispatcher the opted-out reader, on the broadcast push backend and bearer', () => {
+    assert.match(relaySrc, /optedOut: createOptedOutReader\(\{[\s\S]*?secret: process\.env\.PUSH_ADMIN_SECRET/);
+  });
 
   it('requires the sender and dispatcher modules', () => {
     assert.match(relaySrc, /require\('\.\/lib\/apns-live-activity\.cjs'\)/);

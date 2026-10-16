@@ -36,7 +36,7 @@ const { createPollGenerationGuard } = require('./lib/poll-generation-guard.cjs')
 const { createXPollCycle } = require('./lib/x-poll-cycle.cjs');
 // Live Activity (APNs) push for CRITICAL news alerts — docs/live-activity-push.md.
 const { createApnsLiveActivitySender } = require('./lib/apns-live-activity.cjs');
-const { createLiveActivityDispatcher, createUpstashCommandClient } = require('./lib/live-activity-dispatch.cjs');
+const { createLiveActivityDispatcher, createOptedOutReader, createUpstashCommandClient } = require('./lib/live-activity-dispatch.cjs');
 // Broadcast APNs alert to every registered iOS device — docs/broadcast-push.md.
 const { createBroadcastPushDispatcher, LEVEL_RANK: BROADCAST_LEVEL_RANK } = require('./lib/broadcast-push.cjs');
 // AI World Brief slot push — docs/broadcast-push.md.
@@ -4438,6 +4438,12 @@ if (LIVE_ACTIVITY_ENABLED) {
       redis: createUpstashCommandClient({ url: UPSTASH_REDIS_REST_URL, token: UPSTASH_REDIS_REST_TOKEN }),
       sender: liveActivitySender,
       translate: liveActivityTranslate,
+      // Same backend and bearer as the broadcast push; inert without the secret.
+      optedOut: createOptedOutReader({
+        baseUrl: process.env.BROADCAST_PUSH_BASE_URL || 'https://world-monitor-app.vercel.app',
+        secret: process.env.PUSH_ADMIN_SECRET,
+        log: console,
+      }),
       log: console,
     });
   } catch (e) {
