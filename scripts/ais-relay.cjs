@@ -7628,6 +7628,64 @@ function startChokepointFlowsSeedLoop() {
 }
 
 // ─────────────────────────────────────────────────────────────
+// Earthquakes — delegated to standalone seed script (USGS M4.5+ week
+// + NRCan Atom → seismology:earthquakes:v1). Upstream runs it as its
+// own 5-min Railway cron; this fork has no such service, so the relay
+// schedules it. A failed run is retried by the next tick; the key's
+// 6h TTL carries the last good reading across a passing outage.
+// ─────────────────────────────────────────────────────────────
+
+const EARTHQUAKES_SEED_INTERVAL_MS = 5 * 60 * 1000;
+const EARTHQUAKES_SEED_TIMEOUT_MS = 2 * 60 * 1000;
+const EARTHQUAKES_SEED_SCRIPT = path.join(__dirname, 'seed-earthquakes.mjs');
+
+let earthquakesSeedInFlight = false;
+
+function runEarthquakesSeedScript() {
+  return new Promise((resolve, reject) => {
+    execFile(process.execPath, [EARTHQUAKES_SEED_SCRIPT], {
+      env: process.env,
+      timeout: EARTHQUAKES_SEED_TIMEOUT_MS,
+      maxBuffer: 1024 * 1024,
+    }, (err, stdout, stderr) => {
+      relayLogScriptOutput('[Earthquakes]', stdout);
+      if (stderr) {
+        const trimmedErr = String(stderr).trim();
+        if (trimmedErr) {
+          for (const line of trimmedErr.split('\n')) console.warn(`[Earthquakes] ${line}`);
+        }
+      }
+      if (err) return reject(err);
+      resolve();
+    });
+  });
+}
+
+async function seedEarthquakes() {
+  if (earthquakesSeedInFlight) {
+    console.log('[Earthquakes] Skipped (in-flight)');
+    return;
+  }
+  earthquakesSeedInFlight = true;
+  try {
+    await runEarthquakesSeedScript();
+  } catch (e) {
+    console.warn('[Earthquakes] Seed error:', e?.killed ? 'timeout' : (e?.message || e));
+  } finally {
+    earthquakesSeedInFlight = false;
+  }
+}
+
+function startEarthquakesSeedLoop() {
+  if (!UPSTASH_ENABLED) {
+    console.log('[Earthquakes] Disabled (no Upstash Redis)');
+    return;
+  }
+  console.log(`[Earthquakes] Seed loop starting (interval ${EARTHQUAKES_SEED_INTERVAL_MS / 1000 / 60}min)`);
+  startBootSeedLoop('Earthquakes', 'seed-meta:seismology:earthquakes', EARTHQUAKES_SEED_INTERVAL_MS, seedEarthquakes, (e) => console.warn('[Earthquakes] Initial seed error:', e?.message || e), (e) => console.warn('[Earthquakes] Seed error:', e?.message || e));
+}
+
+// ─────────────────────────────────────────────────────────────
 // PizzINT Seed — Pentagon Pizza Index + GDELT tensions → Redis
 // Fetches from pizzint.watch on Railway (datacenter IPs blocked
 // from Vercel Edge). Vercel handler reads from seed key only.
@@ -13813,6 +13871,7 @@ server.listen(PORT, () => {
   startWsbTickersSeedLoop();
   startClimateNewsSeedLoop();
   startChokepointFlowsSeedLoop();
+  startEarthquakesSeedLoop();
   startPizzintSeedLoop();
   startDodoPriceSeedLoop();
 });

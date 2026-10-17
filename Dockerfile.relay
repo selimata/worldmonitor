@@ -122,6 +122,9 @@ COPY scripts/_climate-news-helpers.mjs ./scripts/_climate-news-helpers.mjs
 COPY scripts/_html-entities.mjs ./scripts/_html-entities.mjs
 COPY scripts/seed-climate-news.mjs ./scripts/seed-climate-news.mjs
 COPY scripts/seed-chokepoint-flows.mjs ./scripts/seed-chokepoint-flows.mjs
+# ais-relay execFile()s the earthquake seeder (startEarthquakesSeedLoop).
+COPY scripts/seed-earthquakes.mjs ./scripts/seed-earthquakes.mjs
+COPY scripts/seismology/nrcan-atom.mjs ./scripts/seismology/nrcan-atom.mjs
 COPY scripts/seed-ember-electricity.mjs ./scripts/seed-ember-electricity.mjs
 
 # Shared helper required by the relay (rss-allowed-domains.cjs)
