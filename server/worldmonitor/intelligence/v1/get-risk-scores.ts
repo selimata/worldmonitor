@@ -611,9 +611,18 @@ async function fetchACLEDEvents(): Promise<Array<{ country: string; event_type: 
   // A single 30-day request at limit:1500 silently drops tail events once the
   // global count exceeds the cap; splitting ensures post-conflict countries
   // (low recent activity, higher older activity) are not squeezed out.
+  // fetchAcledCached rethrows upstream errors (cachedFetchJson only caches a
+  // 30 s sentinel, then throws). Uncaught, one ACLED 4xx/5xx failed the whole
+  // payload, and every country fell back to the empty-input baseline scores.
+  const acledOrEmpty = (window: string) => (err: unknown) => {
+    console.warn(`[CII] ACLED ${window} window failed: ${err instanceof Error ? err.message : String(err)}`);
+    return [];
+  };
   const [recent, older] = await Promise.all([
-    fetchAcledCached({ eventTypes, startDate: recentWindow.startDate, endDate: recentWindow.endDate, limit: 1000 }),
-    fetchAcledCached({ eventTypes, startDate: olderWindow.startDate, endDate: olderWindow.endDate, limit: 1000 }),
+    fetchAcledCached({ eventTypes, startDate: recentWindow.startDate, endDate: recentWindow.endDate, limit: 1000 })
+      .catch(acledOrEmpty('recent')),
+    fetchAcledCached({ eventTypes, startDate: olderWindow.startDate, endDate: olderWindow.endDate, limit: 1000 })
+      .catch(acledOrEmpty('older')),
   ]);
 
   const toRow = (e: (typeof recent)[number]) => {
