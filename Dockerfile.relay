@@ -122,9 +122,19 @@ COPY scripts/_climate-news-helpers.mjs ./scripts/_climate-news-helpers.mjs
 COPY scripts/_html-entities.mjs ./scripts/_html-entities.mjs
 COPY scripts/seed-climate-news.mjs ./scripts/seed-climate-news.mjs
 COPY scripts/seed-chokepoint-flows.mjs ./scripts/seed-chokepoint-flows.mjs
-# ais-relay execFile()s the earthquake seeder (startEarthquakesSeedLoop).
+# ais-relay execFile()s these seeders (SCRIPT_SEEDERS / startScriptSeedLoop).
 COPY scripts/seed-earthquakes.mjs ./scripts/seed-earthquakes.mjs
 COPY scripts/seismology/nrcan-atom.mjs ./scripts/seismology/nrcan-atom.mjs
+COPY scripts/seed-cyber-threats.mjs ./scripts/seed-cyber-threats.mjs
+COPY scripts/seed-internet-outages.mjs ./scripts/seed-internet-outages.mjs
+COPY scripts/seed-security-advisories.mjs ./scripts/seed-security-advisories.mjs
+COPY scripts/seed-sanctions-pressure.mjs ./scripts/seed-sanctions-pressure.mjs
+COPY scripts/_sanctions-source.mjs ./scripts/_sanctions-source.mjs
+COPY scripts/_sema-sanctions.mjs ./scripts/_sema-sanctions.mjs
+COPY scripts/_content-age-helpers.mjs ./scripts/_content-age-helpers.mjs
+COPY scripts/fetch-gpsjam.mjs ./scripts/fetch-gpsjam.mjs
+COPY scripts/_gpsjam-parse.mjs ./scripts/_gpsjam-parse.mjs
+COPY scripts/seed-displacement-summary.mjs ./scripts/seed-displacement-summary.mjs
 COPY scripts/seed-ember-electricity.mjs ./scripts/seed-ember-electricity.mjs
 
 # Shared helper required by the relay (rss-allowed-domains.cjs)

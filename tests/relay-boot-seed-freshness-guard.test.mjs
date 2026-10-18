@@ -205,7 +205,6 @@ const SEEDERS = [
   ['WsbTickers', "'seed-meta:intelligence:wsb-tickers'", 'WSB_TICKERS_INTERVAL_MS', 'seedWsbTickers'],
   ['ClimateNewsSeed', "'relay:heartbeat:climate-news'", 'CLIMATE_NEWS_SEED_INTERVAL_MS', 'seedClimateNews'],
   ['ChokepointFlows', "'relay:heartbeat:chokepoint-flows'", 'CHOKEPOINT_FLOWS_SEED_INTERVAL_MS', 'seedChokepointFlows'],
-  ['Earthquakes', "'seed-meta:seismology:earthquakes'", 'EARTHQUAKES_SEED_INTERVAL_MS', 'seedEarthquakes'],
   ['PizzINT', "'seed-meta:intelligence:pizzint'", 'PIZZINT_SEED_INTERVAL_MS', 'seedPizzint'],
   ['DodoPrices', "'seed-meta:product-catalog'", 'DODO_PRICE_SEED_INTERVAL_MS', 'seedDodoPrices'],
   ['Transit', "'seed-meta:supply_chain:chokepoint_transits'", 'CHOKEPOINT_TRANSIT_INTERVAL_MS', 'seedChokepointTransits'],
@@ -219,6 +218,25 @@ for (const [label, metaKey, intervalConst, seedFn] of SEEDERS) {
     assert.ok(relaySource.includes(call), `expected boot-seed wiring: ${call}`);
   });
 }
+
+// -- Standalone seed scripts the relay execFile()s (SCRIPT_SEEDERS). Each one
+// is gated by startBootSeedLoop through startScriptSeedLoop, and each script
+// must be COPY'd into the relay image — a missing COPY is a child that dies on
+// ERR_MODULE_NOT_FOUND every tick while the relay itself looks healthy.
+test('every SCRIPT_SEEDERS entry is complete and its script is COPY\'d into Dockerfile.relay', () => {
+  const table = relaySource.match(/const SCRIPT_SEEDERS = \[([\s\S]*?)\n\];/);
+  assert.ok(table, 'expected a SCRIPT_SEEDERS table in ais-relay.cjs');
+  const entries = [...table[1].matchAll(/\{ label: '([^']+)', script: '([^']+)', metaKey: '([^']+)', intervalMs: [^,]+, timeoutMs: [^,}]+/g)];
+  const declared = (table[1].match(/\{ label: '/g) || []).length;
+  assert.ok(entries.length > 0, 'expected SCRIPT_SEEDERS entries');
+  assert.equal(entries.length, declared, 'every SCRIPT_SEEDERS entry needs label, script, metaKey, intervalMs and timeoutMs in that order');
+  const dockerfile = readFileSync(resolve(here, '../Dockerfile.relay'), 'utf8');
+  for (const [, label, script, metaKey] of entries) {
+    assert.match(metaKey, /^seed-meta:/, `${label}: metaKey must be the seed-meta key the script writes`);
+    assert.ok(dockerfile.includes(`COPY scripts/${script} ./scripts/${script}`), `${label}: Dockerfile.relay must COPY scripts/${script}`);
+  }
+  assert.match(extractNamedFunction(relaySource, 'startScriptSeedLoop'), /startBootSeedLoop\(seeder\.label, seeder\.metaKey, seeder\.intervalMs,/);
+});
 
 test('exactly the expected number of boot seeds are scheduled (no drift)', () => {
   const count = (relaySource.match(/startBootSeedLoop\('/g) || []).length;

@@ -7628,32 +7628,44 @@ function startChokepointFlowsSeedLoop() {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Earthquakes — delegated to standalone seed script (USGS M4.5+ week
-// + NRCan Atom → seismology:earthquakes:v1). Upstream runs it as its
-// own 5-min Railway cron; this fork has no such service, so the relay
-// schedules it. A failed run is retried by the next tick; the key's
-// 6h TTL carries the last good reading across a passing outage.
+// Standalone seed scripts. Upstream runs each of these as its own Railway
+// cron service; this fork has no such services, so the relay schedules
+// them. Children run one at a time (the ~60s sanctions run must not stack
+// with the 5-min quake run). A failed run retries on a 1,3,5,8… minute
+// backoff that never reaches past the next regular tick; each key's TTL
+// carries the last good reading meanwhile.
 // ─────────────────────────────────────────────────────────────
 
-const EARTHQUAKES_SEED_INTERVAL_MS = 5 * 60 * 1000;
-const EARTHQUAKES_SEED_TIMEOUT_MS = 2 * 60 * 1000;
-const EARTHQUAKES_SEED_SCRIPT = path.join(__dirname, 'seed-earthquakes.mjs');
+const SCRIPT_SEED_RETRY_MIN = [1, 3, 5, 8, 13, 21, 34, 55, 89];
 
-let earthquakesSeedInFlight = false;
+// metaKey is the seed-meta key the script writes: startBootSeedLoop reads its
+// fetchedAt so a relay restart doesn't refetch data that is still fresh.
+const SCRIPT_SEEDERS = [
+  { label: 'Earthquakes', script: 'seed-earthquakes.mjs', metaKey: 'seed-meta:seismology:earthquakes', intervalMs: 5 * 60_000, timeoutMs: 2 * 60_000 },
+  { label: 'CyberThreats', script: 'seed-cyber-threats.mjs', metaKey: 'seed-meta:cyber:threats', intervalMs: 60 * 60_000, timeoutMs: 3 * 60_000 },
+  { label: 'InternetOutages', script: 'seed-internet-outages.mjs', metaKey: 'seed-meta:infra:outages', intervalMs: 30 * 60_000, timeoutMs: 3 * 60_000, requiredEnv: 'CLOUDFLARE_API_TOKEN' },
+  // Its feeds go through an RSS proxy that defaults to upstream's
+  // proxy.worldmonitor.app; point it at this relay's own public /rss.
+  { label: 'Advisories', script: 'seed-security-advisories.mjs', metaKey: 'seed-meta:intelligence:advisories', intervalMs: 60 * 60_000, timeoutMs: 3 * 60_000, env: () => ({ RELAY_URL: `http://127.0.0.1:${PORT}` }) },
+  { label: 'Sanctions', script: 'seed-sanctions-pressure.mjs', metaKey: 'seed-meta:sanctions:pressure', intervalMs: 6 * 60 * 60_000, timeoutMs: 5 * 60_000 },
+  // Without --output it also dumps the ~300 KB payload to stdout (= relay log).
+  { label: 'GpsJam', script: 'fetch-gpsjam.mjs', metaKey: 'seed-meta:intelligence:gpsjam', intervalMs: 6 * 60 * 60_000, timeoutMs: 3 * 60_000, args: ['--output', path.join(require('os').tmpdir(), 'gpsjam-latest.json')] },
+  { label: 'Displacement', script: 'seed-displacement-summary.mjs', metaKey: 'seed-meta:displacement:summary', intervalMs: 12 * 60 * 60_000, timeoutMs: 3 * 60_000 },
+];
 
-function runEarthquakesSeedScript() {
+let scriptSeedQueue = Promise.resolve();
+
+function runSeedScript(seeder) {
   return new Promise((resolve, reject) => {
-    execFile(process.execPath, [EARTHQUAKES_SEED_SCRIPT], {
-      env: process.env,
-      timeout: EARTHQUAKES_SEED_TIMEOUT_MS,
+    execFile(process.execPath, [path.join(__dirname, seeder.script), ...(seeder.args || [])], {
+      env: { ...process.env, ...(seeder.env ? seeder.env() : {}) },
+      timeout: seeder.timeoutMs,
       maxBuffer: 1024 * 1024,
     }, (err, stdout, stderr) => {
-      relayLogScriptOutput('[Earthquakes]', stdout);
-      if (stderr) {
-        const trimmedErr = String(stderr).trim();
-        if (trimmedErr) {
-          for (const line of trimmedErr.split('\n')) console.warn(`[Earthquakes] ${line}`);
-        }
+      relayLogScriptOutput(`[${seeder.label}]`, stdout);
+      const trimmedErr = String(stderr || '').trim();
+      if (trimmedErr) {
+        for (const line of trimmedErr.split('\n')) console.warn(`[${seeder.label}] ${line}`);
       }
       if (err) return reject(err);
       resolve();
@@ -7661,28 +7673,50 @@ function runEarthquakesSeedScript() {
   });
 }
 
-async function seedEarthquakes() {
-  if (earthquakesSeedInFlight) {
-    console.log('[Earthquakes] Skipped (in-flight)');
-    return;
-  }
-  earthquakesSeedInFlight = true;
-  try {
-    await runEarthquakesSeedScript();
-  } catch (e) {
-    console.warn('[Earthquakes] Seed error:', e?.killed ? 'timeout' : (e?.message || e));
-  } finally {
-    earthquakesSeedInFlight = false;
-  }
+function makeScriptSeedFn(seeder) {
+  let queued = false;
+  let failures = 0;
+  let retryTimer = null;
+  const seed = () => {
+    if (queued) {
+      console.log(`[${seeder.label}] Skipped (in-flight)`);
+      return Promise.resolve();
+    }
+    queued = true;
+    if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
+    const run = scriptSeedQueue
+      .then(() => runSeedScript(seeder))
+      .then(() => { failures = 0; }, (e) => {
+        const delayMin = SCRIPT_SEED_RETRY_MIN[failures++];
+        const retry = delayMin !== undefined && delayMin * 60_000 < seeder.intervalMs;
+        // The child's stderr is already logged line by line above; e.message would repeat it.
+        const why = e?.killed ? 'timeout' : (e?.code != null ? `exit ${e.code}` : (e?.message || e));
+        console.warn(`[${seeder.label}] Seed error: ${why}${retry ? ` — retrying in ${delayMin}min` : ''}`);
+        if (retry) {
+          retryTimer = setTimeout(() => { retryTimer = null; seed(); }, delayMin * 60_000);
+          retryTimer.unref?.();
+        }
+      })
+      .finally(() => { queued = false; });
+    scriptSeedQueue = run;
+    return run;
+  };
+  return seed;
 }
 
-function startEarthquakesSeedLoop() {
+function startScriptSeedLoop() {
   if (!UPSTASH_ENABLED) {
-    console.log('[Earthquakes] Disabled (no Upstash Redis)');
+    console.log('[ScriptSeeds] Disabled (no Upstash Redis)');
     return;
   }
-  console.log(`[Earthquakes] Seed loop starting (interval ${EARTHQUAKES_SEED_INTERVAL_MS / 1000 / 60}min)`);
-  startBootSeedLoop('Earthquakes', 'seed-meta:seismology:earthquakes', EARTHQUAKES_SEED_INTERVAL_MS, seedEarthquakes, (e) => console.warn('[Earthquakes] Initial seed error:', e?.message || e), (e) => console.warn('[Earthquakes] Seed error:', e?.message || e));
+  for (const seeder of SCRIPT_SEEDERS) {
+    if (seeder.requiredEnv && !process.env[seeder.requiredEnv]) {
+      console.log(`[${seeder.label}] Disabled (no ${seeder.requiredEnv})`);
+      continue;
+    }
+    console.log(`[${seeder.label}] Seed loop starting (interval ${seeder.intervalMs / 60_000}min)`);
+    startBootSeedLoop(seeder.label, seeder.metaKey, seeder.intervalMs, makeScriptSeedFn(seeder), (e) => console.warn(`[${seeder.label}] Initial seed error:`, e?.message || e));
+  }
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -13871,7 +13905,7 @@ server.listen(PORT, () => {
   startWsbTickersSeedLoop();
   startClimateNewsSeedLoop();
   startChokepointFlowsSeedLoop();
-  startEarthquakesSeedLoop();
+  startScriptSeedLoop();
   startPizzintSeedLoop();
   startDodoPriceSeedLoop();
 });
