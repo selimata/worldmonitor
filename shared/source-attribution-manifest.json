@@ -11,6 +11,9 @@
       "status": "excluded",
       "references": [
         {
+          "path": "scripts/ais-relay.cjs"
+        },
+        {
           "path": "src/components/LiveNewsPanel.ts"
         },
         {
