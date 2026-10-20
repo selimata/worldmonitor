@@ -7739,6 +7739,22 @@ function pizzintDefconBand(score) {
   return { defconLevel, defconLabel: PIZZINT_DEFCON_LABELS[defconLevel] };
 }
 
+// pizzint.watch can answer a full, "fresh" row set in which every location has
+// `current_popularity: null` / `data_source: "none"` — its Google popular-times
+// scraper is down while its API is up (observed 2026-10-20, 0/24 sparkline
+// points for all six venues). Such a response is not a reading: projected as-is
+// it publishes six NO DATA rows under "Normal Activity 0%", and the fallback
+// never engages because the array is not empty. A source counts as blind only
+// when nothing is measured now AND nothing was measured in the last 24h, so a
+// healthy source at 4am (all shops closed, daytime points still in the
+// sparkline) keeps winning and the venue list does not flip nightly.
+function pizzintWatchHasReadings(rawData) {
+  const measured = (v) => typeof v === 'number' && Number.isFinite(v);
+  return rawData.some((d) =>
+    (measured(d?.current_popularity) && d?.data_source !== 'none')
+    || (Array.isArray(d?.sparkline_24h) && d.sparkline_24h.some((p) => measured(p?.current_popularity))));
+}
+
 // Projects raw pizzint.watch rows into our PizzintStatus shape. Activity is
 // averaged over OPEN locations only — a closed store reports 0 popularity and
 // would otherwise drag the index down overnight. Spikes add a flat bonus per
@@ -7895,11 +7911,12 @@ async function seedPizzint() {
         failMessage = `[PizzINT] Seed failed: HTTP ${resp.status}`;
       } else {
         const raw = await resp.json();
-        if (raw.success && Array.isArray(raw.data) && raw.data.length > 0) {
+        if (raw.success && Array.isArray(raw.data) && raw.data.length > 0 && pizzintWatchHasReadings(raw.data)) {
           pizzint = projectPizzintWatch(raw.data);
         } else {
           const reason = !raw.success ? 'unsuccessful_response'
-            : !Array.isArray(raw.data) ? 'non_array_data' : 'empty_array';
+            : !Array.isArray(raw.data) ? 'non_array_data'
+              : raw.data.length === 0 ? 'empty_array' : 'no_readings';
           failMessage = `[PizzINT] No data in API response (${reason}); preserving last good observation`;
         }
       }

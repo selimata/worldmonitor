@@ -204,3 +204,54 @@ test('a pentagonpizzaalert.com fallback failure still preserves the last good ob
     '[PizzINT] No data in API response (empty_array); preserving last good observation',
   ]]);
 });
+
+// pizzint.watch answered a full "fresh" row set with every location at
+// `current_popularity: null` / `data_source: "none"` and an all-null 24h
+// sparkline (observed 2026-10-20): the API was up while its Google scraper was
+// down. The array is not empty, so the old guard projected six NO DATA rows
+// under "Normal Activity 0%" and never reached the fallback.
+const blindRow = (id) => ({
+  place_id: id, name: id, current_popularity: null, percentage_of_usual: null,
+  is_spike: false, data_source: 'none', data_freshness: 'fresh', is_closed_now: false,
+  recorded_at: '2026-10-20T04:41:17.750Z',
+  sparkline_24h: [{ place_id: id, current_popularity: null }, { place_id: id, current_popularity: null }],
+});
+const blindResponse = { success: true, data: [blindRow('a'), blindRow('b')] };
+
+test('a row set with no readings at all is classified no_readings and preserves the last observation', async () => {
+  const { state, seed } = harness();
+  await seed();
+  const previous = structuredClone(state.cache);
+  state.now += 600_000;
+  state.source = blindResponse;
+  await seed();
+  assert.deepEqual(state.warnings, [[
+    '[PizzINT] No data in API response (no_readings); preserving last good observation',
+  ]]);
+  assert.deepEqual(state.cache, previous);
+});
+
+test('a row set with no readings takes the pentagonpizzaalert.com fallback', async () => {
+  const { state, seed } = harness();
+  state.source = blindResponse;
+  state.ppa = { ok: true, status: 200, text: async () => PPA_FIXTURE_HTML };
+  await seed();
+  const pizzint = state.cache.get(payloadKey).data.data.pizzint;
+  assert.equal(pizzint.locations[0].dataSource, 'pentagonpizzaalert.com');
+  assert.equal(pizzint.locationsMonitored, 2);
+  assert.ok(state.writes.includes(payloadKey));
+});
+
+test('a healthy source at night (nothing measured now, daytime points in the sparkline) is not a fallback', async () => {
+  const { state, seed } = harness();
+  const night = blindRow('a');
+  night.is_closed_now = true;
+  night.sparkline_24h.push({ place_id: 'a', current_popularity: 40 });
+  state.source = { success: true, data: [night] };
+  state.ppa = { ok: true, status: 200, text: async () => PPA_FIXTURE_HTML };
+  await seed();
+  const pizzint = state.cache.get(payloadKey).data.data.pizzint;
+  assert.equal(pizzint.locations[0].dataSource, 'none', 'pizzint.watch still wins');
+  assert.equal(pizzint.locationsOpen, 0);
+  assert.ok(!state.urls.some((u) => u.includes('pentagonpizzaalert.com')), 'fallback never fetched');
+});

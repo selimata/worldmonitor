@@ -34,6 +34,17 @@ function gdeltYmd(d) {
   return d.toISOString().slice(0, 10).replace(/-/g, '');
 }
 
+// Mirrors pizzintWatchHasReadings in ais-relay.cjs — keep in step. A response
+// whose rows are all `current_popularity: null` / `data_source: "none"` with an
+// empty 24h sparkline (observed 2026-10-20) is the scraper being down behind a
+// live API, not a quiet night; it must take the fallback path like an outage.
+function hasReadings(rows) {
+  const measured = (v) => typeof v === 'number' && Number.isFinite(v);
+  return rows.some((d) =>
+    (measured(d?.current_popularity) && d?.data_source !== 'none')
+    || (Array.isArray(d?.sparkline_24h) && d.sparkline_24h.some((p) => measured(p?.current_popularity))));
+}
+
 function projectLocations(rows) {
   return rows.map((d) => ({
     placeId: d.place_id || '',
@@ -214,14 +225,15 @@ async function fetchPizzint() {
     });
     if (resp.ok) {
       const body = await resp.json();
-      if (body.success && Array.isArray(body.data) && body.data.length > 0) raw = body;
+      if (body.success && Array.isArray(body.data) && body.data.length > 0 && hasReadings(body.data)) raw = body;
     }
   } catch { /* fall through to the fallback below */ }
 
   if (!raw) {
-    // pizzint.watch is down, erroring, or answering an empty data array
-    // (observed 2026-09-29) — try the free pentagonpizzaalert.com fallback
-    // before giving up.
+    // pizzint.watch is down, erroring, answering an empty data array
+    // (observed 2026-09-29) or a row set with no readings at all (observed
+    // 2026-10-20) — try the free pentagonpizzaalert.com fallback before
+    // giving up.
     return fetchPentagonPizzaAlert();
   }
 
