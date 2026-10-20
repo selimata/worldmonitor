@@ -255,3 +255,42 @@ test('a healthy source at night (nothing measured now, daytime points in the spa
   assert.equal(pizzint.locationsOpen, 0);
   assert.ok(!state.urls.some((u) => u.includes('pentagonpizzaalert.com')), 'fallback never fetched');
 });
+
+// pentagonpizzaalert.com kept reporting "100% VERY BUSY" at 02:40 EDT for shops
+// Google has closed after midnight (2026-10-20), so the raw fallback claimed
+// every venue open at 3am. pizzint.watch's opening hours still work while its
+// readings are blind, and a fallback venue at the same coordinates inherits
+// its closed state. Different branches of the same chain do not match.
+const districtPizzaPalaceUrl = 'https://www.google.com/maps/place/District+Pizza+Palace/@38.8527414,-77.0557157,17z/data=!3d38.8527414!4d-77.0531408!16s';
+const otherDominosUrl = 'https://www.google.com/maps/place/Domino%27s+Pizza/@38.8627308,-77.0879692,17z/data=!3d38.8627267!4d-77.0853943!16s';
+
+test('a fallback venue closed per pizzint.watch opening hours is published closed, by coordinates not name', async () => {
+  const { state, seed } = harness();
+  state.source = { success: true, data: [
+    { ...blindRow('district'), name: 'District Pizza Palace', address: districtPizzaPalaceUrl, is_closed_now: true },
+    { ...blindRow('dominos-other-branch'), name: "Domino's Pizza", address: otherDominosUrl, is_closed_now: true },
+  ] };
+  state.ppa = { ok: true, status: 200, text: async () => PPA_FIXTURE_HTML };
+  await seed();
+  const pizzint = state.cache.get(payloadKey).data.data.pizzint;
+  assert.deepEqual(
+    pizzint.locations.map((l) => [l.name, l.isClosedNow, l.currentPopularity, l.isSpike]),
+    [['District Pizza Palace', true, 0, false], ["Domino's Pizza", false, 4, false]],
+    'same storefront closes; the Domino\'s 2km away keeps its own reading',
+  );
+  assert.equal(pizzint.locationsOpen, 1);
+  assert.equal(pizzint.activeSpikes, 0, 'a closed venue is never a spike');
+  assert.equal(pizzint.defconLevel, 3, 'the PPA headline is left as PPA computed it');
+});
+
+test('a fallback venue open per pizzint.watch keeps its pentagonpizzaalert.com reading', async () => {
+  const { state, seed } = harness();
+  state.source = { success: true, data: [
+    { ...blindRow('district'), name: 'District Pizza Palace', address: districtPizzaPalaceUrl, is_closed_now: false },
+  ] };
+  state.ppa = { ok: true, status: 200, text: async () => PPA_FIXTURE_HTML };
+  await seed();
+  const pizzint = state.cache.get(payloadKey).data.data.pizzint;
+  assert.deepEqual(pizzint.locations[0] && [pizzint.locations[0].isClosedNow, pizzint.locations[0].currentPopularity, pizzint.locations[0].isSpike], [false, 82, true]);
+  assert.equal(pizzint.locationsOpen, 2);
+});

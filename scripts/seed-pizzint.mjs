@@ -158,7 +158,42 @@ function decodePpaEntities(s) {
   return s.replace(/&amp;/g, '&').replace(/&#x27;/g, "'").replace(/&quot;/g, '"').replace(/&#39;/g, "'");
 }
 
-async function fetchPentagonPizzaAlert() {
+// Mirrors ais-relay.cjs — keep in step. pizzint.watch's Google popular-times scraper can be blind while its venue
+// metadata still works: `is_closed_now` keeps tracking opening hours. The
+// pentagonpizzaalert.com homepage, by contrast, kept showing "100% VERY BUSY"
+// for shops Google has closed after midnight (observed 02:40 EDT 2026-10-20),
+// so a raw fallback claimed every venue open at 3am. Where a fallback venue is
+// the same storefront as a pizzint.watch one (coordinates within 100m — names
+// are not enough, PPA's Domino's and Papa John's are different branches 2km
+// away) and pizzint.watch says it is closed, the row is published closed with
+// no activity. The PPA headline (level/composite) is left as PPA computed it.
+function pizzintWatchCoords(row) {
+  if (Number.isFinite(row?.lat) && Number.isFinite(row?.lng) && (row.lat || row.lng)) return { lat: row.lat, lng: row.lng };
+  const m = String(row?.address || '').match(/!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)/);
+  return m ? { lat: Number(m[1]), lng: Number(m[2]) } : null;
+}
+
+function applyPizzintWatchHours(locations, pwRows) {
+  const closedAt = [];
+  for (const row of Array.isArray(pwRows) ? pwRows : []) {
+    const c = pizzintWatchCoords(row);
+    if (c && row.is_closed_now === true) closedAt.push(c);
+  }
+  let applied = 0;
+  for (const loc of locations) {
+    if (!(loc.lat || loc.lng)) continue;
+    const scale = 111_320 * Math.cos((loc.lat * Math.PI) / 180);
+    const closed = closedAt.some((c) => Math.hypot((c.lat - loc.lat) * 111_320, (c.lng - loc.lng) * scale) <= 100);
+    if (!closed) continue;
+    loc.isClosedNow = true;
+    loc.currentPopularity = 0;
+    loc.isSpike = false;
+    applied += 1;
+  }
+  return applied;
+}
+
+async function fetchPentagonPizzaAlert(pizzintWatchRows = []) {
   const resp = await fetch(PENTAGON_PIZZA_ALERT_URL, {
     headers: { Accept: 'text/html', 'User-Agent': CHROME_UA },
     signal: AbortSignal.timeout(15_000),
@@ -199,6 +234,8 @@ async function fetchPentagonPizzaAlert() {
     };
   });
 
+  applyPizzintWatchHours(locations, pizzintWatchRows);
+
   const defconLevel = PPA_LEVEL_TO_DEFCON[levelMatch[1]] || 5;
   return {
     pizzint: {
@@ -218,6 +255,9 @@ async function fetchPentagonPizzaAlert() {
 
 async function fetchPizzint() {
   let raw = null;
+  // Kept even when the rows carry no readings: their opening hours still
+  // gate the fallback (applyPizzintWatchHours).
+  let pizzintWatchRows = [];
   try {
     const resp = await fetch(PIZZINT_API, {
       headers: { Accept: 'application/json', 'User-Agent': CHROME_UA },
@@ -225,6 +265,7 @@ async function fetchPizzint() {
     });
     if (resp.ok) {
       const body = await resp.json();
+      if (body.success && Array.isArray(body.data)) pizzintWatchRows = body.data;
       if (body.success && Array.isArray(body.data) && body.data.length > 0 && hasReadings(body.data)) raw = body;
     }
   } catch { /* fall through to the fallback below */ }
@@ -234,7 +275,7 @@ async function fetchPizzint() {
     // (observed 2026-09-29) or a row set with no readings at all (observed
     // 2026-10-20) — try the free pentagonpizzaalert.com fallback before
     // giving up.
-    return fetchPentagonPizzaAlert();
+    return fetchPentagonPizzaAlert(pizzintWatchRows);
   }
 
   const locations = projectLocations(raw.data);
