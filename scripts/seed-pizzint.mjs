@@ -17,13 +17,16 @@
 // loop), so this must run on `*/10 * * * *` to stay inside the same contract.
 // CACHE_TTL matches the relay's PIZZINT_SEED_TTL.
 
-import { CHROME_UA, loadEnvFile, runSeed } from './_seed-utils.mjs';
+import { CHROME_UA, loadEnvFile, redisCommand, runSeed } from './_seed-utils.mjs';
 
 loadEnvFile(import.meta.url);
 
 const CANONICAL_KEY = 'intelligence:pizzint:seed:v1';
 const CACHE_TTL = 1800; // 30 min — mirrors PIZZINT_SEED_TTL in ais-relay.cjs
 const PIZZINT_API = 'https://www.pizzint.watch/api/dashboard-data';
+// Opening hours cached from pizzint.watch's baselines; see pizzintWatchHoursTable.
+const PIZZINT_HOURS_KEY = 'intelligence:pizzint:hours:v1';
+const PIZZINT_HOURS_TTL = 30 * 24 * 60 * 60; // 30 days — rewritten on every answer that carries baselines
 const GDELT_BATCH_API = 'https://www.pizzint.watch/api/gdelt/batch';
 const DEFAULT_GDELT_PAIRS = 'usa_russia,russia_ukraine,usa_china,china_taiwan,usa_iran,usa_venezuela';
 // gdelt/batch rejects requests without dateStart/dateEnd (YYYYMMDD). Same
@@ -136,17 +139,21 @@ async function fetchTensionPairs() {
 // scripts/ais-relay.cjs (seedPizzint).
 // ─────────────────────────────────────────────────────────────
 const PENTAGON_PIZZA_ALERT_URL = 'https://pentagonpizzaalert.com/';
+// `hours`: last-resort weekly opening masks (see baselineOpenMasks) for the
+// venues pizzint.watch also tracks, snapshotted from its Google baseline on
+// 2026-10-20. Live and cached baselines take precedence; this only matters
+// when pizzint.watch is down AND the cache is cold.
 const PENTAGON_PIZZA_ALERT_VENUES = {
-  'district-pizza-palace': { address: '2325 S Eads St, Arlington, VA', lat: 38.8527414, lng: -77.0531408 },
+  'district-pizza-palace': { address: '2325 S Eads St, Arlington, VA', lat: 38.8527414, lng: -77.0531408, hours: [16775168, 16775168, 16775168, 16775168, 16775168, 16775169, 16775169] },
   'pizza-hut': { address: '1049 W Glebe Rd, Arlington, VA', lat: 38.8430983, lng: -77.0762855 },
-  'pizzato-pizza': { address: '2626 N Pershing Dr, Arlington, VA', lat: 38.8806865, lng: -77.089827 },
+  'pizzato-pizza': { address: '2626 N Pershing Dr, Arlington, VA', lat: 38.8806865, lng: -77.089827, hours: [16775175, 16775175, 16775175, 16775175, 16775175, 16775183, 16775183] },
   'crystal-city-sports-pub': { address: '529 23rd St S, Arlington, VA', lat: 38.8535379, lng: -77.0543326 },
   'nighthawk-brewery-pizza': { address: '4225 S 28th St, Arlington, VA', lat: 38.8631637, lng: -77.0624806 },
-  'extreme-pizza': { address: '1419 S Fern St, Arlington, VA', lat: 38.8602396, lng: -77.0559854 },
+  'extreme-pizza': { address: '1419 S Fern St, Arlington, VA', lat: 38.8602396, lng: -77.0559854, hours: [4192256, 4192256, 4192256, 4192256, 4192256, 8386560, 8386560] },
   'papa-johns': { address: '2440 Wilson Blvd, Arlington, VA 22201', lat: 38.8903112, lng: -77.0883773 },
   'freddies-beach-bar': { address: '555 23rd St S, Arlington, VA', lat: 38.8535485, lng: -77.0549009 },
   'wiseguy-pizza': { address: '710 12th St S, Arlington, VA 22202', lat: 38.862657, lng: -77.0588418 },
-  'we-the-pizza': { address: '2100 Crystal Dr, Arlington, VA', lat: 38.8551791, lng: -77.049733 },
+  'we-the-pizza': { address: '2100 Crystal Dr, Arlington, VA', lat: 38.8551791, lng: -77.049733, hours: [2095104, 4193280, 4193280, 4193280, 4193280, 4193280, 4192256] },
   'dominos-pizza': { address: '3535 S Ball St, Arlington, VA', lat: 38.8430908, lng: -77.0507832 },
 };
 const PPA_LEVEL_TO_DEFCON = { CRITICAL: 1, HIGH: 2, ELEVATED: 3, GUARDED: 4, NORMAL: 5 };
@@ -158,33 +165,107 @@ function decodePpaEntities(s) {
   return s.replace(/&amp;/g, '&').replace(/&#x27;/g, "'").replace(/&quot;/g, '"').replace(/&#39;/g, "'");
 }
 
-// Mirrors ais-relay.cjs — keep in step. pizzint.watch's Google popular-times scraper can be blind while its venue
-// metadata still works: `is_closed_now` keeps tracking opening hours. The
-// pentagonpizzaalert.com homepage, by contrast, kept showing "100% VERY BUSY"
-// for shops Google has closed after midnight (observed 02:40 EDT 2026-10-20),
-// so a raw fallback claimed every venue open at 3am. Where a fallback venue is
-// the same storefront as a pizzint.watch one (coordinates within 100m — names
-// are not enough, PPA's Domino's and Papa John's are different branches 2km
-// away) and pizzint.watch says it is closed, the row is published closed with
-// no activity. The PPA headline (level/composite) is left as PPA computed it.
+// Mirrors ais-relay.cjs — keep in step.
 function pizzintWatchCoords(row) {
   if (Number.isFinite(row?.lat) && Number.isFinite(row?.lng) && (row.lat || row.lng)) return { lat: row.lat, lng: row.lng };
   const m = String(row?.address || '').match(/!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)/);
   return m ? { lat: Number(m[1]), lng: Number(m[2]) } : null;
 }
 
-function applyPizzintWatchHours(locations, pwRows) {
-  const closedAt = [];
-  for (const row of Array.isArray(pwRows) ? pwRows : []) {
-    const c = pizzintWatchCoords(row);
-    if (c && row.is_closed_now === true) closedAt.push(c);
+// Weekly opening hours as seven 24-bit masks (index 0 = Sunday, bit h set =
+// open during hour h, America/New_York), derived from Google's popular-times
+// baseline as pizzint.watch republishes it: an hour counts as open when its
+// baseline popularity is above zero. Hours listed at zero are Google's closed
+// hours (Extreme Pizza lists 6–23 every day but is only ever busy 11–21), and
+// at 00:41 EDT the rule reproduced pizzint.watch's own is_closed_now for all
+// six venues.
+function baselineOpenMasks(baseline) {
+  if (!baseline || typeof baseline !== 'object') return null;
+  const masks = [0, 0, 0, 0, 0, 0, 0];
+  let any = false;
+  for (const [day, hours] of Object.entries(baseline)) {
+    const d = Number(day);
+    if (!(d >= 0 && d <= 6) || !Array.isArray(hours)) continue;
+    for (const h of hours) {
+      if (h && h.popularity > 0 && h.hour >= 0 && h.hour < 24) {
+        masks[d] |= 1 << h.hour;
+        any = true;
+      }
+    }
   }
+  return any ? masks : null;
+}
+
+// What gets cached under PIZZINT_HOURS_KEY: every pizzint.watch venue that
+// carries coordinates and a baseline, so the hours survive a full
+// pizzint.watch outage (its API answered blind rows for a day on 2026-10-20;
+// a 5xx or timeout would have left nothing to gate the fallback with).
+function pizzintWatchHoursTable(rows) {
+  const table = [];
+  for (const row of Array.isArray(rows) ? rows : []) {
+    const c = pizzintWatchCoords(row);
+    const masks = baselineOpenMasks(row?.baseline_popular_times);
+    if (c && masks) table.push({ name: row.name || '', lat: c.lat, lng: c.lng, masks });
+  }
+  return table;
+}
+
+function easternDayHour(nowMs) {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York', weekday: 'short', hour: 'numeric', hour12: false,
+  }).formatToParts(nowMs);
+  const day = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
+    .indexOf(parts.find((p) => p.type === 'weekday')?.value);
+  const hour = Number(parts.find((p) => p.type === 'hour')?.value) % 24;
+  return { day, hour };
+}
+
+function closedByMasks(masks, nowMs) {
+  const { day, hour } = easternDayHour(nowMs);
+  if (day < 0 || !Number.isFinite(hour)) return null;
+  return ((masks[day] >> hour) & 1) === 0;
+}
+
+function nearVenue(loc, c) {
+  const scale = 111_320 * Math.cos((loc.lat * Math.PI) / 180);
+  return Math.hypot((c.lat - loc.lat) * 111_320, (c.lng - loc.lng) * scale) <= 100;
+}
+
+// Whether a fallback venue is closed, from the best opening-hours source for
+// the same storefront (coordinates within 100m — names are not enough, PPA's
+// Domino's and Papa John's are different branches 2km from pizzint.watch's):
+// a live pizzint.watch row (its baseline, else its hourly is_closed_now flag),
+// then the baselines cached from the last pizzint.watch answer, then the
+// static snapshot in the venue table. null means no opinion.
+function fallbackVenueClosed(loc, liveRows, cachedTable, staticMasks, nowMs) {
+  const live = (Array.isArray(liveRows) ? liveRows : []).find((row) => {
+    const c = pizzintWatchCoords(row);
+    return c && nearVenue(loc, c);
+  });
+  if (live) {
+    const masks = baselineOpenMasks(live.baseline_popular_times);
+    if (masks) return closedByMasks(masks, nowMs);
+    if (live.is_closed_now === true) return true;
+    if (live.is_closed_now === false) return false;
+  }
+  const cached = (Array.isArray(cachedTable) ? cachedTable : [])
+    .find((v) => Array.isArray(v?.masks) && Number.isFinite(v.lat) && Number.isFinite(v.lng) && nearVenue(loc, v));
+  if (cached) return closedByMasks(cached.masks, nowMs);
+  if (Array.isArray(staticMasks)) return closedByMasks(staticMasks, nowMs);
+  return null;
+}
+
+// The pentagonpizzaalert.com homepage kept showing "100% VERY BUSY" for shops
+// Google has closed after midnight (observed 02:40 EDT 2026-10-20), so a raw
+// fallback claimed every venue open at 3am. A venue the hours say is closed
+// is published closed with no activity. The PPA headline (level/composite)
+// is left as PPA computed it.
+function applyPizzintWatchHours(locations, liveRows, cachedTable, nowMs) {
   let applied = 0;
   for (const loc of locations) {
     if (!(loc.lat || loc.lng)) continue;
-    const scale = 111_320 * Math.cos((loc.lat * Math.PI) / 180);
-    const closed = closedAt.some((c) => Math.hypot((c.lat - loc.lat) * 111_320, (c.lng - loc.lng) * scale) <= 100);
-    if (!closed) continue;
+    const staticMasks = PENTAGON_PIZZA_ALERT_VENUES[String(loc.placeId).replace(/^ppa:/, '')]?.hours;
+    if (fallbackVenueClosed(loc, liveRows, cachedTable, staticMasks, nowMs) !== true) continue;
     loc.isClosedNow = true;
     loc.currentPopularity = 0;
     loc.isSpike = false;
@@ -193,7 +274,33 @@ function applyPizzintWatchHours(locations, pwRows) {
   return applied;
 }
 
-async function fetchPentagonPizzaAlert(pizzintWatchRows = []) {
+async function readHoursCache() {
+  const url = process.env.UPSTASH_REDIS_REST_URL;
+  const token = process.env.UPSTASH_REDIS_REST_TOKEN;
+  if (!url || !token) return null;
+  try {
+    const body = await redisCommand(url, token, ['GET', PIZZINT_HOURS_KEY], { label: 'PizzINT hours GET' });
+    return body.result ? JSON.parse(body.result) : null;
+  } catch (err) {
+    console.warn(`[PizzINT] hours cache read failed: ${err?.message || err}`);
+    return null;
+  }
+}
+
+// Non-fatal: the hours cache is a convenience for the next outage.
+async function writeHoursCache(table) {
+  const url = process.env.UPSTASH_REDIS_REST_URL;
+  const token = process.env.UPSTASH_REDIS_REST_TOKEN;
+  if (!url || !token) return;
+  try {
+    const value = JSON.stringify({ fetchedAt: Date.now(), venues: table });
+    await redisCommand(url, token, ['SET', PIZZINT_HOURS_KEY, value, 'EX', PIZZINT_HOURS_TTL], { label: 'PizzINT hours SET' });
+  } catch (err) {
+    console.warn(`[PizzINT] hours cache write failed: ${err?.message || err}`);
+  }
+}
+
+async function fetchPentagonPizzaAlert(pizzintWatchRows = [], cachedHours = null) {
   const resp = await fetch(PENTAGON_PIZZA_ALERT_URL, {
     headers: { Accept: 'text/html', 'User-Agent': CHROME_UA },
     signal: AbortSignal.timeout(15_000),
@@ -234,7 +341,7 @@ async function fetchPentagonPizzaAlert(pizzintWatchRows = []) {
     };
   });
 
-  applyPizzintWatchHours(locations, pizzintWatchRows);
+  applyPizzintWatchHours(locations, pizzintWatchRows, cachedHours?.venues, Date.now());
 
   const defconLevel = PPA_LEVEL_TO_DEFCON[levelMatch[1]] || 5;
   return {
@@ -266,6 +373,8 @@ async function fetchPizzint() {
     if (resp.ok) {
       const body = await resp.json();
       if (body.success && Array.isArray(body.data)) pizzintWatchRows = body.data;
+      const hoursTable = pizzintWatchHoursTable(pizzintWatchRows);
+      if (hoursTable.length > 0) await writeHoursCache(hoursTable);
       if (body.success && Array.isArray(body.data) && body.data.length > 0 && hasReadings(body.data)) raw = body;
     }
   } catch { /* fall through to the fallback below */ }
@@ -275,7 +384,7 @@ async function fetchPizzint() {
     // (observed 2026-09-29) or a row set with no readings at all (observed
     // 2026-10-20) — try the free pentagonpizzaalert.com fallback before
     // giving up.
-    return fetchPentagonPizzaAlert(pizzintWatchRows);
+    return fetchPentagonPizzaAlert(pizzintWatchRows, await readHoursCache());
   }
 
   const locations = projectLocations(raw.data);

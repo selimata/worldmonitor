@@ -30,7 +30,7 @@ const PPA_FIXTURE_HTML = '<html><body>'
 
 function harness() {
   const state = {
-    source: validResponse, writes: [], warnings: [], cache: new Map(), now: 1_790_335_140_000, failPayload: false,
+    source: validResponse, sourceDown: false, writes: [], warnings: [], cache: new Map(), now: 1_790_335_140_000, failPayload: false,
     urls: [], gdelt: { ok: true, status: 200, json: async () => ({}) },
     ppa: { ok: true, status: 200, text: async () => PPA_NO_MATCH_HTML },
   };
@@ -39,10 +39,14 @@ function harness() {
     Date: Clock, AbortSignal, CHROME_UA: 'test', console: { log() {}, warn: (...args) => state.warnings.push(args) },
     fetch: async (url) => {
       state.urls.push(url);
-      if (url.includes('dashboard-data')) return { ok: true, json: async () => state.source };
+      if (url.includes('dashboard-data')) {
+        if (state.sourceDown) throw new Error('fetch failed');
+        return { ok: true, json: async () => state.source };
+      }
       if (url.includes('pentagonpizzaalert.com')) return state.ppa;
       return state.gdelt;
     },
+    upstashGet: async (key) => state.cache.get(key)?.data ?? null,
     upstashSet: async (key, data, ttl) => {
       if (key === payloadKey && state.failPayload) return false;
       state.writes.push(key);
@@ -163,6 +167,7 @@ test('reports a rejected GDELT request by status without logging its body', asyn
 
 test('falls back to pentagonpizzaalert.com when pizzint.watch has no data, and publishes it', async () => {
   const { state, seed } = harness();
+  state.now = Date.UTC(2026, 8, 25, 23, 39); // Friday 19:39 EDT — District Pizza Palace is open per its static hours
   state.source = emptyResponse;
   state.ppa = { ok: true, status: 200, text: async () => PPA_FIXTURE_HTML };
   await seed();
@@ -293,4 +298,64 @@ test('a fallback venue open per pizzint.watch keeps its pentagonpizzaalert.com r
   const pizzint = state.cache.get(payloadKey).data.data.pizzint;
   assert.deepEqual(pizzint.locations[0] && [pizzint.locations[0].isClosedNow, pizzint.locations[0].currentPopularity, pizzint.locations[0].isSpike], [false, 82, true]);
   assert.equal(pizzint.locationsOpen, 2);
+});
+
+// The harness clock is Friday 2026-09-25 07:39 EDT. Opening hours for the
+// fallback must survive pizzint.watch being fully down (5xx/timeout, no rows):
+// baselines are cached from its last answer, and a static snapshot covers a
+// cold cache.
+const hoursKey = 'intelligence:pizzint:hours:v1';
+const fridayBaseline = (from, to) => ({
+  5: Array.from({ length: to - from + 1 }, (_, i) => ({ hour: from + i, popularity: 50 })),
+});
+
+test('a live baseline beats the hourly is_closed_now flag, and is cached', async () => {
+  const { state, seed } = harness();
+  state.source = { success: true, data: [
+    { ...blindRow('district'), name: 'District Pizza Palace', address: districtPizzaPalaceUrl, is_closed_now: true, baseline_popular_times: fridayBaseline(7, 21) },
+  ] };
+  state.ppa = { ok: true, status: 200, text: async () => PPA_FIXTURE_HTML };
+  await seed();
+  const pizzint = state.cache.get(payloadKey).data.data.pizzint;
+  assert.deepEqual([pizzint.locations[0].isClosedNow, pizzint.locations[0].currentPopularity], [false, 82], 'open at 07:39 per the baseline');
+  assert.ok(state.writes.includes(hoursKey), 'baselines are cached for the next outage');
+  const cached = state.cache.get(hoursKey).data.venues[0];
+  assert.equal(cached.lat, 38.8527414);
+  assert.equal((cached.masks[5] >> 7) & 1, 1);
+  assert.equal((cached.masks[5] >> 22) & 1, 0);
+});
+
+test('with pizzint.watch fully down, cached opening hours still close a fallback venue', async () => {
+  const { state, seed } = harness();
+  state.source = { success: true, data: [
+    { ...blindRow('district'), name: 'District Pizza Palace', address: districtPizzaPalaceUrl, current_popularity: 40, data_source: 'live', baseline_popular_times: fridayBaseline(11, 23) },
+  ] };
+  await seed();
+  assert.equal(state.cache.get(payloadKey).data.data.pizzint.locations[0].dataSource, 'live');
+  assert.ok(state.writes.includes(hoursKey));
+  state.now += 600_000;
+  state.sourceDown = true;
+  state.ppa = { ok: true, status: 200, text: async () => PPA_FIXTURE_HTML };
+  await seed();
+  const pizzint = state.cache.get(payloadKey).data.data.pizzint;
+  assert.deepEqual(
+    pizzint.locations.map((l) => [l.name, l.isClosedNow, l.currentPopularity, l.isSpike]),
+    [['District Pizza Palace', true, 0, false], ["Domino's Pizza", false, 4, false]],
+  );
+  assert.equal(pizzint.locationsOpen, 1);
+  assert.equal(pizzint.activeSpikes, 0);
+});
+
+test('with pizzint.watch fully down and a cold cache, the static snapshot closes a fallback venue', async () => {
+  const { state, seed } = harness();
+  state.sourceDown = true;
+  state.ppa = { ok: true, status: 200, text: async () => PPA_FIXTURE_HTML };
+  await seed();
+  const pizzint = state.cache.get(payloadKey).data.data.pizzint;
+  assert.deepEqual(
+    pizzint.locations.map((l) => [l.name, l.isClosedNow, l.currentPopularity]),
+    [['District Pizza Palace', true, 0], ["Domino's Pizza", false, 4]],
+    'District (static hours 11–23) is closed at 07:39; PPA\'s Domino\'s has no snapshot and keeps its reading',
+  );
+  assert.equal(pizzint.locationsOpen, 1);
 });
