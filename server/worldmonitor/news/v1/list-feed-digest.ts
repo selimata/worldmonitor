@@ -1911,7 +1911,18 @@ async function buildDigest(variant: string, lang: string): Promise<ListFeedDiges
 // finds almost every feed warm and fresh. A failed re-fetch leaves the good
 // row in place (keepOnFailure): the build's own path still handles expiry.
 
-export const FEED_WARM_MAX_AGE_S = 600;
+export const FEED_WARM_MAX_AGE_S = 1200;
+
+// Feeds that have returned nothing from Vercel for days (checked 2026-10-26:
+// 404/402 gone or paywalled, 403/429/202 bot walls, or empty bodies). The
+// warmer re-fetched each one every call for nothing; the digest build still
+// tries them on its own schedule, so a feed that recovers is picked up there.
+// Matched by name, not URL: the source-attribution scan treats URL literals
+// as references. Only the `full` variant is warmed today.
+const FEED_WARM_SKIP_NAMES = new Set([
+  'PBS NewsHour', 'Telegraph', 'Zerkalo', '+972 Magazine', 'VentureBeat AI',
+  'Yahoo Finance', 'Business Wire', 'News24', 'The Reporter Ethiopia', 'Japan Today',
+]);
 /** No new fetch starts after this; one in flight still has FEED_TIMEOUT_MS. Fits the 25s Edge ceiling. */
 export const FEED_WARM_START_BUDGET_MS = 12_000;
 
@@ -1969,7 +1980,9 @@ export async function warmFeedCache(
 ): Promise<FeedWarmResult> {
   const start = now();
   const byUrl = new Map<string, ServerFeed>();
-  for (const { feed } of buildDigestFeedBatches(variant, lang).allEntries) byUrl.set(feed.url, feed);
+  for (const { feed } of buildDigestFeedBatches(variant, lang).allEntries) {
+    if (!FEED_WARM_SKIP_NAMES.has(feed.name)) byUrl.set(feed.url, feed);
+  }
   const feeds = [...byUrl.values()];
   const base = { variant, lang, feeds: feeds.length, stale: 0, refreshed: 0, failed: 0, notStarted: 0 };
 
