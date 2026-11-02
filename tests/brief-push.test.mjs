@@ -227,13 +227,13 @@ describe('audience', () => {
     assert.deepEqual(fetchImpl.calls[0].body.audience.timezone, ['Europe/Istanbul']);
   });
 
-  it('targets only the low cohort and never unset-priority devices', async () => {
+  it('targets the low and medium cohorts, unset-priority devices included', async () => {
     const { notifier, fetchImpl } = make();
     await notifier.notifyPublished();
     const { audience } = fetchImpl.calls[0].body;
-    assert.deepEqual(audience.priority, ['low']);
-    assert.deepEqual([...DEFAULT_COHORTS], ['low']);
-    assert.equal(audience.includeUnsetPriority, false);
+    assert.deepEqual(audience.priority, ['low', 'medium']);
+    assert.deepEqual([...DEFAULT_COHORTS], ['low', 'medium']);
+    assert.equal(audience.includeUnsetPriority, true);
   });
 
   it('uses APNs priority 5 and routes to the brief tab', async () => {

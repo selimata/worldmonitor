@@ -53,7 +53,7 @@
  *   PUSH_ADMIN_SECRET     bearer for pages/api/push/send.ts
  *   BRIEF_PUSH_MORNING_HOUR  local hour for the overnight recap, default 10
  *   BRIEF_PUSH_EVENING_HOUR  local hour for the day's close, default 19
- *   BRIEF_PUSH_COHORTS    comma list, default "low"
+ *   BRIEF_PUSH_COHORTS    comma list, default "low,medium"
  *   BRIEF_PUSH_PAGE_SIZE  devices per request, default 5000
  *   BRIEF_PUSH_MAX_PAGES  runaway guard, default 20
  *   BRIEF_PUSH_DISCOVER_SLUG  Discover article the tap opens, default "daily-brief";
@@ -85,11 +85,13 @@ const DISCOVER_CHECK_TIMEOUT_MS = 10_000;
  */
 const SLOT_DEDUP_TTL_S = 6 * 60 * 60;
 /**
- * `low` = "All breaking news updates" — the only tier whose wording admits a
- * scheduled digest. `medium` and `high` both promise event severity filtering,
- * which a brief cannot satisfy.
+ * `low` and `medium` (the owner's call, 2026-11-02: a twice-daily digest is
+ * fine for medium too). `high` promises only the most severe events, so a
+ * schedule stays out of it.
  */
-const DEFAULT_COHORTS = Object.freeze(['low']);
+const DEFAULT_COHORTS = Object.freeze(['low', 'medium']);
+/** iOS default when the user never picked a tier; unset devices go with it. */
+const APP_DEFAULT_PRIORITY = 'medium';
 
 const RELEASABLE_STATUSES = new Set([400, 401, 403, 404, 405, 413, 422]);
 
@@ -407,9 +409,8 @@ function createBriefPushNotifier({ env, redis, fetchImpl, log = console, now = (
     return {
       audience: {
         priority: [...audienceCohorts],
-        // Deliberately false: an unset priority means the iOS default
-        // (`medium`), which promises severity filtering a digest cannot meet.
-        includeUnsetPriority: false,
+        // An unset priority means the iOS default (`medium`).
+        includeUnsetPriority: audienceCohorts.includes(APP_DEFAULT_PRIORITY),
         timezone: zones,
         limit: pageSize,
       },

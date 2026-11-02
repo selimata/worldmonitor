@@ -276,13 +276,13 @@ Dedup is keyed per slot per UTC tick, not per day: each tick serves a different
 band of zones, so a global daily key would let the first band through and starve
 the other 23.
 
-## Audience is `low` only
+## Audience is `low` + `medium`
 
-A brief has no severity — it is a schedule, not an event — so it goes solely to
-the cohort whose Settings wording ("All breaking news updates") admits a digest.
-`medium` and `high` both promise severity filtering a brief cannot satisfy, and
-`includeUnsetPriority` is hard-coded false because unset means the iOS default
-`medium`. Widening `BRIEF_PUSH_COHORTS` means changing what Settings promises.
+A brief has no severity — it is a schedule, not an event. It went only to `low`
+("All breaking news updates") until 2026-11-02; the owner then opened it to
+`medium` too, so the iOS default reaches it. `includeUnsetPriority` follows
+`medium` (unset means the iOS default), as in broadcast push. `high` stays out:
+it promises only the most severe events.
 
 ## Copy
 
@@ -310,7 +310,7 @@ announcing a refresh that did not happen is worse than silence.
 | `PUSH_ADMIN_SECRET` | Railway `seed-insights` | — | same value as Vercel |
 | `BRIEF_PUSH_MORNING_HOUR` | Railway | `10` | local hour, clamped 0-23 |
 | `BRIEF_PUSH_EVENING_HOUR` | Railway | `19` | local hour, clamped 0-23 |
-| `BRIEF_PUSH_COHORTS` | Railway | `low` | widening changes what Settings promises |
+| `BRIEF_PUSH_COHORTS` | Railway | `low,medium` | unset devices follow `medium` |
 | `BRIEF_PUSH_PAGE_SIZE` | Railway | `5000` | |
 | `BRIEF_PUSH_MAX_PAGES` | Railway | `20` | |
 
