@@ -4011,6 +4011,11 @@ const CLASSIFY_LLM_PROVIDERS = [
     apiUrl: 'https://api.groq.com/openai/v1/chat/completions',
     model: GROQ_DEFAULT_MODEL,
     headers: (key) => ({ Authorization: `Bearer ${key}`, 'Content-Type': 'application/json', 'User-Agent': CHROME_UA }),
+    // gpt-oss-20b defaults to medium reasoning and spends ~1,800 of the
+    // max_tokens budget (titles × 40) on reasoning, so the JSON array is cut
+    // off (finish_reason=length) and every batch parses to null → `_skip`.
+    // Verified 2026-11-13: low effort → 50/50 parsed, ~400 reasoning tokens.
+    extraBody: { reasoning_effort: 'low' },
     timeout: 30000,
   },
 ];
