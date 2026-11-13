@@ -3963,7 +3963,45 @@ function classifyCacheKey(title) {
 // LLM provider fallback chain — mirrors seed-insights.mjs LLM_PROVIDERS
 // Order mirrors server/_shared/llm.ts: paid OpenRouter, two fixed free
 // OpenRouter variants, then Groq.
+/**
+ * Claude (first-party API) as the primary classify/translate transport. The
+ * other entries speak the OpenAI chat shape over raw https; this one goes
+ * through the SDK already used by the widget agent, so providers that carry
+ * `chat` are called directly and the OpenAI-shaped transport is skipped.
+ * Thinking is always on for Opus 5.5 — effort low keeps it short, and
+ * max_tokens leaves room for it on top of the JSON answer.
+ * @returns {Promise<string|null>} assistant text, null on any failure.
+ */
+const ANTHROPIC_CLASSIFY_MODEL = (process.env.ANTHROPIC_CLASSIFY_MODEL || 'claude-opus-5-5').trim();
+async function anthropicChat({ system, user, maxTokens, timeout }) {
+  const apiKey = (process.env.ANTHROPIC_API_KEY || '').trim();
+  if (!apiKey) return null;
+  try {
+    const { default: Anthropic } = await import('@anthropic-ai/sdk');
+    const client = new Anthropic({ apiKey, timeout, maxRetries: 1 });
+    const response = await client.messages.create({
+      model: ANTHROPIC_CLASSIFY_MODEL,
+      max_tokens: maxTokens,
+      system,
+      messages: [{ role: 'user', content: user }],
+      output_config: { effort: 'low' },
+    });
+    if (response.stop_reason === 'refusal') return null;
+    const text = response.content.filter((b) => b.type === 'text').map((b) => b.text).join('').trim();
+    return text || null;
+  } catch (e) {
+    console.warn(`[LLM] anthropic failed: ${e?.status ?? ''} ${String(e?.message || e).slice(0, 200)}`);
+    return null;
+  }
+}
+
 const CLASSIFY_LLM_PROVIDERS = [
+  {
+    name: 'anthropic',
+    envKey: 'ANTHROPIC_API_KEY',
+    chat: anthropicChat,
+    timeout: 45000,
+  },
   {
     name: 'ollama',
     envKey: 'OLLAMA_API_URL',
@@ -4070,11 +4108,23 @@ async function classifyFetchLlm(titles) {
     const envVal = process.env[provider.envKey];
     if (!envVal) continue;
 
-    const apiUrl = provider.apiUrlFn ? provider.apiUrlFn(envVal) : provider.apiUrl;
-    const model = typeof provider.model === 'function' ? provider.model() : provider.model;
-    const headers = provider.headers(envVal);
-
-    const result = await classifyFetchLlmSingle(titles, envVal, apiUrl, model, headers, provider.extraBody || {}, provider.timeout);
+    let result = null;
+    if (provider.chat) {
+      const sanitized = titles.map((t) => t.replace(/[\n\r]/g, ' ').replace(/\|/g, '/').slice(0, 200).trim());
+      const raw = await provider.chat({
+        system: CLASSIFY_SYSTEM_PROMPT,
+        user: sanitized.map((t, i) => `${i}|${t}`).join('\n'),
+        maxTokens: titles.length * 40 + 4000,
+        timeout: provider.timeout,
+      });
+      const match = raw && raw.match(/\[[\s\S]*\]/);
+      try { result = match ? JSON.parse(match[0]) : null; } catch { result = null; }
+    } else {
+      const apiUrl = provider.apiUrlFn ? provider.apiUrlFn(envVal) : provider.apiUrl;
+      const model = typeof provider.model === 'function' ? provider.model() : provider.model;
+      const headers = provider.headers(envVal);
+      result = await classifyFetchLlmSingle(titles, envVal, apiUrl, model, headers, provider.extraBody || {}, provider.timeout);
+    }
     if (result) {
       return result;
     }
@@ -4538,12 +4588,26 @@ async function liveActivityTranslate(title, langs) {
   for (const provider of CLASSIFY_LLM_PROVIDERS) {
     const envVal = process.env[provider.envKey];
     if (!envVal) continue;
-    const apiUrl = provider.apiUrlFn ? provider.apiUrlFn(envVal) : provider.apiUrl;
-    const model = typeof provider.model === 'function' ? provider.model() : provider.model;
-    const got = await liveActivityTranslateOnce(
-      title, missing, apiUrl, model, provider.headers(envVal),
-      provider.extraBody || {}, LIVE_ACTIVITY_I18N_TIMEOUT_MS,
-    );
+    let got = null;
+    if (provider.chat) {
+      const clean = title.replace(/[\n\r]/g, ' ').slice(0, 200).trim();
+      const raw = await provider.chat({
+        system: LIVE_ACTIVITY_I18N_SYSTEM_PROMPT,
+        user: `Languages: ${missing.join(', ')}\nHeadline: ${clean}`,
+        maxTokens: 80 * missing.length + 2000,
+        // 30+ languages plus thinking take longer than the 12 s OpenAI-shape budget.
+        timeout: 45000,
+      });
+      const match = raw && raw.match(/\{[\s\S]*\}/);
+      try { got = match ? JSON.parse(match[0]) : null; } catch { got = null; }
+    } else {
+      const apiUrl = provider.apiUrlFn ? provider.apiUrlFn(envVal) : provider.apiUrl;
+      const model = typeof provider.model === 'function' ? provider.model() : provider.model;
+      got = await liveActivityTranslateOnce(
+        title, missing, apiUrl, model, provider.headers(envVal),
+        provider.extraBody || {}, LIVE_ACTIVITY_I18N_TIMEOUT_MS,
+      );
+    }
     if (got && typeof got === 'object') {
       const merged = { ...have };
       for (const lang of missing) {
